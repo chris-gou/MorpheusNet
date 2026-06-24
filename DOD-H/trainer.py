@@ -7,10 +7,29 @@ from tensorflow.keras.utils import to_categorical
 from scipy.signal import butter, lfilter
 import random
 import json
+from sklearn.metrics import confusion_matrix, classification_report
+
 
 tf.random.set_seed(100)
+SEQ_LEN=12
+DB_PATH = "/mnt/truenas_db/user/christina/morpheus"
 
-
+TRAIN_PARAMS = {
+    "gh_original": {
+        "cnn_batch_size": 32,
+        "cnn_epochs": 5,
+        "cnn_lr": 10e-3,
+        "seq_batch_size": 32,
+        "seq_epochs": 15,
+    },
+    "paper_original": {
+        "cnn_batch_size": 128,
+        "cnn_epochs": 10,
+        "cnn_lr": 0.001,
+        "seq_batch_size": 32,
+        "seq_epochs": 15,
+    }
+}
 class Configuration:
     """
     Class for MorpheusNet training configuration
@@ -37,6 +56,10 @@ class Configuration:
         self.dataset_config = self.config.get("dataset", {})
         self.training_config = self.config.get("training_params", {})
         self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
+
+        self.run_type = self.config.get("run_type", "paper_original")
+        self.hparams = TRAIN_PARAMS.get(self.run_type, "paper_original")
+        self.data_path = self.dataset_config.get("data_path", "")
 
     def _load_config(self, base_config_path, override_config_path):
         with open(base_config_path) as base_config_file:
@@ -105,25 +128,31 @@ def get_fold_indices(fold_number, total_folds=25):
 
     
 
-def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str, model_path: str):
+def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str) -> dict:
     """
     Train one fold
     
     Args:
         configuration (Configuration): The configuration object containing all necessary parameters.
+        fold (int): Fold number to train.
+        data_path (str): Path to the dataset.
+        results_path (str): Path to save the results.
 
     Returns:
-        str: str of result
+        dict: A dictionary containing the training results.
 
     Raises:
         Exception: if something is invalid
 
     """ 
     t = cfg.training
+    hp = cfg.hparams
+    epoch_duration = t.get("epoch_duration",30)
 
+    # create checkpoints
     best_model_file_cnn = os.path.join(results_path, f'{cfg.name}_best_cnn_fold{fold}.h5')
     best_model_file_seq = os.path.join(results_path, f'{cfg.name}_best_seq_fold{fold}.h5')
-    checkpoint_callback_cnn = tf.keras.callbacks.ModelCheckpoint(filepath=best_model_file, 
+    checkpoint_callback_cnn = tf.keras.callbacks.ModelCheckpoint(filepath=best_model_file_cnn, 
                                                     monitor='val_loss', 
                                                     mode = 'min',
                                                     save_best_only=True,
@@ -135,10 +164,135 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
                                                       save_best_only=True,
                                                       save_freq="epoch")
 
-    
-    pass
+    # ====== data splits ======
+    train_inds, test_inds, val_inds = get_fold_indices(fold, t.get("folds", 25), cv_type=t.get("cv_type", "kfold"))
+    np.save(os.path.join(results_path, f'train_ind_dooh_fold{fold}.npy'), train_inds)
+    np.save(os.path.join(results_path, f'test_ind_dodh_fold{fold}.npy'), test_inds)
+    np.save(os.path.join(results_path, f'val_ind_dodh_fold{fold}.npy'), val_inds)
 
-# main loop for going thorugh the 25 folds (LOO)
+    # create train, val, test sets
+    x_train, y_train = create_set(train_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
+    x_val, y_val = create_set(val_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
+    x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
+    x_train, y_train = shuffle(x_train, y_train)
+
+    # ===== CNN =====
+    optimizer = tf.keras.optimizers.Adam(learning_rate = hp.get("cnn_lr", 0.001))
+    model = separable_resnet((1,cfg.window_length,1), 5, y_train = y_train, bias = False)
+    model.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
+    model.fit(x_train, to_categorical(y_train), batch_size=hp.get("cnn_batch_size", 512), epochs=hp.get("cnn_epochs", 10), 
+              validation_data = (x_val, to_categorical(y_val)), callbacks = [checkpoint_callback])
+    
+    model = tf.keras.models.load_model(best_model_file)
+
+    y_pred_cnn = np.argmax(model.predict(x_test, verbose=0), axis=1)
+    print(confusion_matrix(y_test, y_pred_cnn, labels=[0, 1, 2, 3, 4]))
+
+    # ===== PQT =====
+    saved_model_dir = os.path.join(results_path, f'saved_model_fold_{fold}')
+    model.export(saved_model_dir)
+    x_rep = x_train[np.random.randint(0,len(x_train),500)]
+    def representative_dataset():
+        for data in x_rep:
+            yield [data.astype(np.float32).reshape((1,1,epoch_duration*100,1))]
+        
+    converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8  
+    converter.inference_output_type = tf.int8  
+
+    tflite_path = os.path.join(results_path, f"cnn_full_int_fold{fold}.tflite")
+    with open(tflite_path, "wb") as f:
+        f.write(converter.convert())
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    # ===== SEQ =====
+    # sets
+    optimizer = tf.keras.optimizers.Adam(learning_rate = 10e-3)
+    seq_learner = seq_model(int(seq_len*5))
+    seq_learner.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
+    seq_learner.fit(x_train_seq, to_categorical(y_train_seq), batch_size=hp["seq_batch_size"], epochs=hp["seq_epochs"], 
+            validation_data = (x_val_seq, to_categorical(y_val_seq)), callbacks = [checkpoint_callback_seq])
+    seq_learner = tf.keras.models.load_model(best_model_file_seq)
+        
+    y_pred_seq = np.argmax(seq_learner.predict(x_test_seq, verbose=0), axis=1)
+    print(confusion_matrix(y_test_seq, y_pred_seq, labels=[0, 1, 2, 3, 4]))  # rows=true, cols=pred
+    print(classification_report(y_test_seq, y_pred_seq, target_names=['Wake', 'N1', 'N2', 'N3', 'REM']))
+
+    return {
+        "cnn_acc":       float(np.mean(y_pred_cnn == y_test.flatten())),
+        "cnn_mf1":       float(f1_score(y_test, y_pred_cnn, average="macro")),
+        "cnn_kappa":     float(cohen_kappa_score(y_test.flatten(), y_pred_cnn)),
+        "cnn_per_class": f1_score(y_test, y_pred_cnn, average=None, labels=[0,1,2,3,4]).tolist(),
+        "seq_acc":       float(np.mean(np.array(y_pred_seq) == np.array(y_te_s))),
+        "seq_mf1":       float(f1_score(y_te_s, y_pred_seq, average="macro")),
+        "seq_kappa":     float(cohen_kappa_score(y_te_s, y_pred_seq)),
+        "seq_per_class": f1_score(y_te_s, y_pred_seq, average=None, labels=[0,1,2,3,4]).tolist(),
+    }
+
+# ====== Aggregate fold results ======
+def aggregate_and_save(cfg: Configuration, fold_results: list):
+    class_names = ["Wake", "N1", "N2", "N3", "REM"]
+
+    def means(key):  return [r[key] for r in fold_results]
+ 
+    results = {
+        "dataset": cfg.name,
+        "cnn": {
+            "accuracy_mean":   float(np.mean(means("cnn_acc"))),
+            "mf1_mean":        float(np.mean(means("cnn_mf1"))),
+            "kappa_mean":      float(np.mean(means("cnn_kappa"))),
+            "per_class_f1":    {n: float(np.mean([r["cnn_per_class"][i] for r in fold_results]))
+                                for i, n in enumerate(class_names)},
+            "accuracy_per_fold": means("cnn_acc"),
+            "mf1_per_fold":      means("cnn_mf1"),
+        },
+        "seq": {
+            "accuracy_mean":   float(np.mean(means("seq_acc"))),
+            "mf1_mean":        float(np.mean(means("seq_mf1"))),
+            "kappa_mean":      float(np.mean(means("seq_kappa"))),
+            "per_class_f1":    {n: float(np.mean([r["seq_per_class"][i] for r in fold_results]))
+                                for i, n in enumerate(class_names)},
+            "accuracy_per_fold": means("seq_acc"),
+            "mf1_per_fold":      means("seq_mf1"),
+        },
+    }
+ 
+    out = os.path.join(cfg.save_dir, "results.json")
+    with open(out, "w") as f:
+        json.dump(results, f, indent=4)
+ 
+    print(f"\nCNN  MF1: {results['cnn']['mf1_mean']:.4f}")
+    print(f"Seq  MF1: {results['seq']['mf1_mean']:.4f}")
+    print(f"Results → {out}")
+    return results
+
+def run(name:str, run_cfg: dict):
+    cfg = Configuration(run_cfg)
+    save_dir = os.path.join(DB_PATH, name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    results_file_path = os.path.join(save_dir, "results.json")
+    if os.path.isfile(results_file_path):
+        print(f"Results already exist for {name} → {results_file_path}")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"Config: {name}  |  type: {cfg.run_type}  |  epoch: {cfg.epoch_duration}s  |  folds: {cfg.folds}")
+    print(f"{'='*60}")
+
+    fold_results = []
+    for fold in range(cfg.folds):
+        fold_results.append(train_fold(cfg, fold, cfg.data_path, save_dir))
+
+    aggregate_and_save(cfg, fold_results)
+
+if __name__ == "__main__":
+    run(name, cfg)
+
+# main loop for going through the 25 folds (LOO)
 for fold in range(1,25):
     # checkpoints to save the best model based on validation loss for each model
     best_model_file = f'dreem_ase_model_fold{fold}.h5'
