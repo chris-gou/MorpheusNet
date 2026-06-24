@@ -271,7 +271,7 @@ def run(base_config_path, override_config_path=None):
     print(f"{'='*60}")
 
     fold_results = []
-    for fold in range(cfg.folds):
+    for fold in range(cfg.training.get("folds", 25)):
         fold_results.append(train_fold(cfg, fold, cfg.data_path, cfg.save_dir))
 
     aggregate_and_save(cfg, fold_results)

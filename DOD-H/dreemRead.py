@@ -41,7 +41,7 @@ def extract_data(ind, eeg_chan = 'F3_F4', path = '', epoch_length=30):
         glob.glob(os.path.join(path, '*', '*.hdf5')))
     
     if h5:
-        x, hyp = extract_h5(ind, h5, epoch_length=30, channel=eeg_chan)
+        x, hyp = extract_h5(ind, h5, epoch_length, channel=eeg_chan)
         return x, hyp
     
     files = glob.glob(os.path.join(path, '*.npz')) + glob.glob(os.path.join(path, '*', '*.npz'))
@@ -79,11 +79,11 @@ def extract_npz(ind, files, epoch_length, eeg_chan):
     chan_idx = np.where(channel_labels == eeg_chan)[0]
     
     # x is expected to be already epoched at 100 Hz (30 s -> 3000 samples).
-    if x.ndim == 2 and x.shape[1] == epoch_length * 100:
+    if x.ndim == 2 and x.shape[1] == 30 * 100:
         epochs = x[:, None, :, None]                       # (n, 1, 3000, 1)
-    elif x.ndim == 3 and x.shape[1] == epoch_length * 100:               # (n, 3000, C)
+    elif x.ndim == 3 and x.shape[1] == 30 * 100:               # (n, 3000, C)
         epochs = x[:, :, chan_idx][:, None, :, None]
-    elif x.ndim == 3 and x.shape[2] == epoch_length * 100:               # (n, C, 3000)
+    elif x.ndim == 3 and x.shape[2] == 30 * 100:               # (n, C, 3000)
         epochs = x[:, chan_idx, :][:, None, :, None]
     else:
         raise ValueError(f"Unexpected x shape (expected pre-epoched): {x.shape}")

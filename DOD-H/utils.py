@@ -77,7 +77,7 @@ def load_subject(idx, cfg: Configuration) -> list[np.array]:
 
     if x.shape[2] != cfg.window_length:
         # resample data before splitting
-        x = butter_bandpass_filter(x)
+        x = butter_bandpass_filter(x, 0.5, 40, 250)    # bandpassing between 0.5 and 40Hz
         x_r = resample(x, int(len(x)*100/250))
         n_epochs = len(x_r) // cfg.window_length
         x_r = x_r[:n_epochs * cfg.window_length]
@@ -90,51 +90,6 @@ def load_subject(idx, cfg: Configuration) -> list[np.array]:
         epochs = x
         hyp    = np.array(hyp).reshape(len(hyp), 1)
     return epochs, hyp
-
-    recordings = []
-    if dataset == 'Sedf20':
-        for night in [1, 2]:
-            filename = f"SC4{subject_id:02d}{night}E0.npz"
-            filepath = os.path.join(data_path, filename)
-            if not os.path.exists(filepath):
-                continue
-            npz = np.load(filepath, allow_pickle=True)
-            x = npz['x']
-            hyp = np.array(npz['y'])
-            if x.ndim == 3:
-                epochs_30 = x[:, np.newaxis, :, :]
-            if epoch_duration < 30:
-                epochs_30, hyp = split_epochs(epochs_30, hyp, epoch_duration)
-            else:
-                for i in range(len(epochs_30)):
-                    mu, sigma = epochs_30[i].mean(), epochs_30[i].std()
-                    if sigma > 0:
-                        epochs_30[i] = (epochs_30[i] - mu) / sigma
-            recordings.append((epochs_30, hyp))
-            # hyp = hyp[:len(epochs_30)]
-            # recordings.append((epochs_30, hyp))
-    else:
-        x, hyp = extract_data(subject_id, path=data_path, epoch_length=epoch_duration)
-        hyp = np.array(hyp) 
-        if x.ndim == 4:
-            # print("Data already epoched, skipping preprocessing")
-            epochs = x
-            hyp = np.array(hyp)[:len(epochs)]
-        else:
-            x = butter_bandpass_filter(x, 0.5, 40, 250)
-            x_r = resample(x, int(len(x)*100/250))
-            n_epochs = len(x_r) // (epoch_duration*100)
-            x_r = x_r[:n_epochs * 3000]
-            # hyp = np.array(hyp)[:n_epochs]
-            hyp = hyp[:n_epochs]
-            epochs = np.reshape(x_r, (n_epochs, 1, epoch_duration*100, 1))
-            for num in range(len(epochs)):
-                epochs[num] = (epochs[num] - np.mean(epochs[num])) / np.std(epochs[num])
-        # remove -1 hyp epochs
-        mask = hyp != -1
-        epochs, hyp = epochs[mask], hyp[mask] 
-        recordings.append((epochs, hyp))
-    return recordings
 
 def create_set(indices, eeg_channel, data_path, training_params):
     x_set, y_set = [], []
