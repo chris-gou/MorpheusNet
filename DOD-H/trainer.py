@@ -6,8 +6,57 @@ from sklearn.utils import shuffle
 from tensorflow.keras.utils import to_categorical
 from scipy.signal import butter, lfilter
 import random
+import json
 
 tf.random.set_seed(100)
+
+
+class Configuration:
+    """
+    Class for MorpheusNet training configuration
+
+    Attributes:
+
+    Methods:
+    """
+
+    def __init__(self, base_config_path, override_config_path=None):
+        """
+        Initializes the Configuration object.
+
+        Args:
+            base_config_path (str): Path to the base configuration file.
+            override_config_path (str): Path to the override configuration file (optional).
+
+        Raises:
+            FileNotFoundError: If the configuration file does not exist.
+            ValueError: If the configuration file is not in a valid format.
+        """
+
+        self.config = self._load_config(base_config_path, override_config_path)
+        self.dataset_config = self.config.get("dataset", {})
+        self.training_config = self.config.get("training_params", {})
+        self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
+
+    def _load_config(self, base_config_path, override_config_path):
+        with open(base_config_path) as base_config_file:
+            base_config = json.load(base_config_file)
+        # override if necessary
+        if override_config_path:
+            with open(override_config_path) as override_config_file:
+                override_config = json.load(override_config_file)
+            
+            # update any values if they are found in the override, else keep the ones from base
+            end_config = self._update_config(base_config, override_config)
+        return end_config
+    
+    def _update_config(self, base_config, override_config):
+        for key, value in override_config.items():
+            if key in base_config and isinstance(base_config[key], dict) and isinstance(value, dict):
+                self._update_config(base_config[key], value)
+            else:
+                base_config[key] = value
+        return base_config
 
 # Function to create a bandpass filter
 def butter_bandpass(lowcut, highcut, fs, order=5):
@@ -53,6 +102,41 @@ def get_fold_indices(fold_number, total_folds=25):
     ]
 
     return training_indices, [test_index], validation_indices
+
+    
+
+def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str, model_path: str):
+    """
+    Train one fold
+    
+    Args:
+        configuration (Configuration): The configuration object containing all necessary parameters.
+
+    Returns:
+        str: str of result
+
+    Raises:
+        Exception: if something is invalid
+
+    """ 
+    t = cfg.training
+
+    best_model_file_cnn = os.path.join(results_path, f'{cfg.name}_best_cnn_fold{fold}.h5')
+    best_model_file_seq = os.path.join(results_path, f'{cfg.name}_best_seq_fold{fold}.h5')
+    checkpoint_callback_cnn = tf.keras.callbacks.ModelCheckpoint(filepath=best_model_file, 
+                                                    monitor='val_loss', 
+                                                    mode = 'min',
+                                                    save_best_only=True,
+                                                    save_freq="epoch")
+    
+    checkpoint_callback_seq = tf.keras.callbacks.ModelCheckpoint(filepath=best_model_file_seq, 
+                                                      monitor='val_loss', 
+                                                      mode = 'min',
+                                                      save_best_only=True,
+                                                      save_freq="epoch")
+
+    
+    pass
 
 # main loop for going thorugh the 25 folds (LOO)
 for fold in range(1,25):
