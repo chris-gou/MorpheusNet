@@ -1,0 +1,33 @@
+{
+    "dataset": {
+        "name": "DOD-H",
+        "eeg_channel": "F3_F4",
+        "num_splits": 20,
+        "seq_len": 12,
+        "targed_idx": -1,
+        "root_dir": "./",
+        "path": "DOD-H_harmonized/npz"
+    },
+    "training_params": {
+        "max_epochs": 500,
+        "batch_size": 128,
+        "lr": 0.001,
+        "early_stopping": {
+            "mode": "min",
+            "patience": 20
+        },
+        "seq_len": 12,
+        "folds": 25,
+        "cnn_epochs": 10,
+        "seq_epochs": 15,
+        "epoch_duration": 30,
+        "base_epoch_duration": 30,
+        "fs": 100,
+        "hop": 0,
+        "seq_lr": 0.0001,
+        "cnn_lr": 0.001,
+        "seq_batch_size": 32,
+        "cv_type": "loo"
+    },
+    "name": "DOD-H_30"
+}
