@@ -7,8 +7,8 @@ from tensorflow.keras.utils import to_categorical
 from scipy.signal import butter, lfilter
 import random
 import json
-from sklearn.metrics import confusion_matrix, classification_report
-
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, cohen_kappa_score
+import argparse
 
 tf.random.set_seed(100)
 SEQ_LEN=12
@@ -57,6 +57,7 @@ class Configuration:
         self.training_config = self.config.get("training_params", {})
         self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
 
+        # default to paper-specified hyperparams since they give the best results
         self.run_type = self.config.get("run_type", "paper_original")
         self.hparams = TRAIN_PARAMS.get(self.run_type, "paper_original")
         self.data_path = self.dataset_config.get("data_path", "")
@@ -226,10 +227,10 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str)
         "cnn_mf1":       float(f1_score(y_test, y_pred_cnn, average="macro")),
         "cnn_kappa":     float(cohen_kappa_score(y_test.flatten(), y_pred_cnn)),
         "cnn_per_class": f1_score(y_test, y_pred_cnn, average=None, labels=[0,1,2,3,4]).tolist(),
-        "seq_acc":       float(np.mean(np.array(y_pred_seq) == np.array(y_te_s))),
-        "seq_mf1":       float(f1_score(y_te_s, y_pred_seq, average="macro")),
-        "seq_kappa":     float(cohen_kappa_score(y_te_s, y_pred_seq)),
-        "seq_per_class": f1_score(y_te_s, y_pred_seq, average=None, labels=[0,1,2,3,4]).tolist(),
+        "seq_acc":       float(np.mean(np.array(y_pred_seq) == np.array(y_test_seq))),
+        "seq_mf1":       float(f1_score(y_test_seq, y_pred_seq, average="macro")),
+        "seq_kappa":     float(cohen_kappa_score(y_test_seq, y_pred_seq)),
+        "seq_per_class": f1_score(y_test_seq, y_pred_seq, average=None, labels=[0,1,2,3,4]).tolist(),
     }
 
 # ====== Aggregate fold results ======
@@ -269,18 +270,18 @@ def aggregate_and_save(cfg: Configuration, fold_results: list):
     print(f"Results → {out}")
     return results
 
-def run(name:str, run_cfg: dict):
-    cfg = Configuration(run_cfg)
-    save_dir = os.path.join(DB_PATH, name)
+def run(base_config_path, override_config_path=None):
+    cfg = Configuration(base_config_path, override_config_path)
+    save_dir = os.path.join(DB_PATH, cfg.name)
     os.makedirs(save_dir, exist_ok=True)
 
     results_file_path = os.path.join(save_dir, "results.json")
     if os.path.isfile(results_file_path):
-        print(f"Results already exist for {name} → {results_file_path}")
+        print(f"Results already exist for {cfg.name} → {results_file_path}")
         return
 
     print(f"\n{'='*60}")
-    print(f"Config: {name}  |  type: {cfg.run_type}  |  epoch: {cfg.epoch_duration}s  |  folds: {cfg.folds}")
+    print(f"Config: {cfg.name}  |  type: {cfg.run_type}  |  epoch: {cfg.epoch_duration}s  |  folds: {cfg.folds}")
     print(f"{'='*60}")
 
     fold_results = []
@@ -290,7 +291,16 @@ def run(name:str, run_cfg: dict):
     aggregate_and_save(cfg, fold_results)
 
 if __name__ == "__main__":
-    run(name, cfg)
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--data_path', type=str, default='/mnt/truenas_db/user/christina', help='Path of dataset')
+    parser.add_argument('--output_path', type=str, help='Path to save results')
+    parser.add_argument('--config', type=str, default='', help='config file path')
+    parser.add_argument('--debug', action='store_true', default=False, help='Set mode to debug or not')
+    parser.add_argument('--override', type=str, help='config override path')
+
+    args = parser.parse_args()
+
+    run(args.config, args.override)
 
 # main loop for going through the 25 folds (LOO)
 for fold in range(1,25):
