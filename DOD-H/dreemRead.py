@@ -4,6 +4,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import glob
 import h5py
+from scipy.signal import butter, lfilter, resample, welch
+
+
+# Function to create a bandpass filter
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+# Function to apply the bandpass filter
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
 
 # function to read the refrenced F3 signal, EOG and labels
 def do(f1):
@@ -50,9 +66,9 @@ def extract_h5(ind, files, epoch_length=30, channel='F3_M2'):
             return x, hyp
     pass
 
-def extract_npz(ind, files, epoch_length, channel):
+def extract_npz(ind, files, epoch_length, eeg_chan):
     # Function to extract data from npz files
-    npz_file = np.load(os.path.join(path, files[ind]), allow_pickle=True)
+    npz_file = np.load(files[ind], allow_pickle=True)
     channel_labels = np.atleast_1d(npz_file['ch_label'])
     x = npz_file['x']
     y = npz_file['y']
@@ -72,6 +88,8 @@ def extract_npz(ind, files, epoch_length, channel):
     else:
         raise ValueError(f"Unexpected x shape (expected pre-epoched): {x.shape}")
 
+    if epoch_length != 30:
+        epochs, y = split_epochs(epochs, y, epoch_length)
     return epochs.astype(np.float32), y
 
 # function to extract the data from 2 different channels
@@ -114,3 +132,22 @@ def _epoch_continuous(sig, y30, epoch_length, fs=100):
     # print("[_epoch_continuous] post-filter <0.1 Hz:", round(p[fr < 0.1].sum() / p.sum(), 4))
 
     return x, y
+
+def split_epochs(epochs_30s, hyp, epoch_duration, fs=100):
+    window = int(epoch_duration*fs)
+    hop = window
+    base_len = 30 * fs
+
+    starts = list(range(0, base_len-window+1, hop))
+    x_out, y_out = [], []
+
+    for i in range(len(epochs_30s)):
+        for s in starts:
+            w = epochs_30s[i:i+1, :, s:s+window, :]  # (1, 1, window, 1)
+            mu, sigma = w.mean(), w.std()
+            if sigma > 0:
+                w = (w - mu) / sigma
+            x_out.append(w)
+            y_out.append(hyp[i])
+
+    return np.concatenate(x_out, axis=0), np.array(y_out)

@@ -197,6 +197,9 @@ def run_tflite(interpreter, epochs, cfg):
         
         # Get the output tensor
         output_data = interpreter.get_tensor(output_index)
+        output_details = interpreter.get_output_details()
+        output_scale, output_zero_point = output_details[0]['quantization']
+
         dequantized_output = (output_data.astype(np.float32) - output_zero_point) * output_scale
         pred.append(dequantized_output)
     return pred

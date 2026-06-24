@@ -38,7 +38,7 @@ def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_d
         
         x = tf.keras.layers.Activation('relu')(x)
         if reg_drop:
-            x = tf.keras.layers.Dropout(0.1)(x
+            x = tf.keras.layers.Dropout(0.1)(x)
 
     # Global average pooling layer
     x = tf.keras.layers.GlobalAveragePooling2D()(x)

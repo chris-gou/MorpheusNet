@@ -54,14 +54,17 @@ class Configuration:
         """
 
         self.config = self._load_config(base_config_path, override_config_path)
-        self.dataset_config = self.config.get("dataset", {})
-        self.training_config = self.config.get("training_params", {})
+        self.dataset = self.config.get("dataset", {})
+        self.training = self.config.get("training_params", {})
         self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
 
         # default to paper-specified hyperparams since they give the best results
         self.run_type = self.config.get("run_type", "paper_original")
         self.hparams = TRAIN_PARAMS.get(self.run_type, "paper_original")
-        self.data_path = self.dataset_config.get("path", "")
+        self.data_path = self.dataset.get("path", "")
+
+        self.window_length = self.dataset.get("epoch_duration", 30)  * 100
+        self.save_dir = os.path.join(DB_PATH, self.name)
 
     def _load_config(self, base_config_path, override_config_path):
         with open(base_config_path) as base_config_file:
@@ -73,7 +76,7 @@ class Configuration:
             
             # update any values if they are found in the override, else keep the ones from base
             end_config = self._update_config(base_config, override_config)
-        return end_config
+        return end_config if override_config_path else base_config
     
     def _update_config(self, base_config, override_config):
         for key, value in override_config.items():
@@ -157,9 +160,9 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str)
     model = separable_resnet((1,cfg.window_length,1), 5, y_train = y_train, bias = False)
     model.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
     model.fit(x_train, to_categorical(y_train), batch_size=hp.get("cnn_batch_size", 512), epochs=hp.get("cnn_epochs", 10), 
-              validation_data = (x_val, to_categorical(y_val)), callbacks = [checkpoint_callback])
+              validation_data = (x_val, to_categorical(y_val)), callbacks = [checkpoint_callback_cnn])
     
-    model = tf.keras.models.load_model(best_model_file)
+    model = tf.keras.models.load_model(best_model_file_cnn)
 
     y_pred_cnn = np.argmax(model.predict(x_test, verbose=0), axis=1)
     print(confusion_matrix(y_test, y_pred_cnn, labels=[0, 1, 2, 3, 4]))
@@ -255,21 +258,21 @@ def aggregate_and_save(cfg: Configuration, fold_results: list):
 
 def run(base_config_path, override_config_path=None):
     cfg = Configuration(base_config_path, override_config_path)
-    save_dir = os.path.join(DB_PATH, cfg.name)
-    os.makedirs(save_dir, exist_ok=True)
+    
+    os.makedirs(cfg.save_dir, exist_ok=True)
 
-    results_file_path = os.path.join(save_dir, "results.json")
+    results_file_path = os.path.join(cfg.save_dir, "results.json")
     if os.path.isfile(results_file_path):
         print(f"Results already exist for {cfg.name} → {results_file_path}")
         return
 
     print(f"\n{'='*60}")
-    print(f"Config: {cfg.name}  |  type: {cfg.run_type}  |  epoch: {cfg.epoch_duration}s  |  folds: {cfg.folds}")
+    print(f"Config: {cfg.name}  |  type: {cfg.get("run_type")}  |  epoch: {cfg.training.get("epoch_duration")}s  |  folds: {cfg.training.get("folds")}")
     print(f"{'='*60}")
 
     fold_results = []
     for fold in range(cfg.folds):
-        fold_results.append(train_fold(cfg, fold, cfg.data_path, save_dir))
+        fold_results.append(train_fold(cfg, fold, cfg.data_path, cfg.save_dir))
 
     aggregate_and_save(cfg, fold_results)
 
