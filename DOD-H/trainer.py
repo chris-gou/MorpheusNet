@@ -75,6 +75,8 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
         best_model_file_seq = os.path.join(results_path, f'{cfg.name}_best_seq_fold{fold}.h5')
         tflite_path = os.path.join(results_path, f"cnn_full_int_fold{fold}.tflite")
         test_ind_path = os.path.join(results_path, f'test_ind_dodh_fold{fold}.npy')
+        if not os.path.isfile(test_ind_path):
+            test_ind_path = os.path.join(results_path, f'test_ind_fold{fold}.npy')
         fold_done = os.path.isfile(best_model_file_seq) and os.path.isfile(tflite_path) and os.path.isfile(test_ind_path) # is fold complete? cnn + seq -> nothing to train for this fold
         cnn_done = os.path.isfile(best_model_file_cnn) and os.path.isfile(tflite_path) # is only cnn for this fold complete? -> train seq
 
@@ -179,6 +181,7 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
                     if epochs is None or labels is None:
                         continue  # Skip if data extraction failed
                     preds = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
+                    print(f"Fold {fold}: min: {preds.min()}, max: {preds.max()}, unique: {np.unique(preds)}, mean: {preds.mean():.4f}, std: {preds.std():.4f}")
                     y_pred_cnn.extend(preds)
                     y_test.extend(labels)
                 y_pred_cnn, y_test = np.array(y_pred_cnn), np.array(y_test)
@@ -196,6 +199,7 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
                     if epochs is None or labels is None:
                         continue
                     preds = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
+                    # print(f"Fold {fold}: min: {preds.min()}, max: {preds.max()}, unique: {np.unique(preds)}, mean: {preds.mean():.4f}, std: {preds.std():.4f}")
                     y_pred_cnn.extend(preds)
                     y_test.extend(labels)
                 y_pred_cnn, y_test = np.array(y_pred_cnn), np.array(y_test)
@@ -211,11 +215,15 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
         x_val_seq, y_val_seq = create_seq_sets(val_inds, interpreter, cfg)
         x_test_seq, y_test_seq = create_seq_sets(test_inds, interpreter, cfg)
 
+        x_arr = np.array(x_train_seq)
+        print("min:", x_arr.min(), "max:", x_arr.max(), "mean:", x_arr.mean(), "std:", x_arr.std())
+        print("NaN:", np.isnan(x_arr).any(), "Inf:", np.isinf(x_arr).any())
+
         x_train_seq = np.reshape(np.array(x_train_seq),(len(x_train_seq),int(seq_len*5)))
         x_val_seq = np.reshape(np.array(x_val_seq),(len(x_val_seq),int(seq_len*5)))
         x_test_seq = np.reshape(np.array(x_test_seq),(len(x_test_seq),int(seq_len*5)))
 
-        optimizer = tf.keras.optimizers.Adam(learning_rate = 10e-3)
+        optimizer = tf.keras.optimizers.Adam(learning_rate = 1e-3, clipnorm=1.0) # gradient clipping
         seq_learner = seq_model(int(seq_len*5))
         seq_learner.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
         seq_learner.fit(x_train_seq, to_categorical(y_train_seq), batch_size=hp["seq_batch_size"], epochs=hp["seq_epochs"], 
@@ -349,7 +357,7 @@ def small_train(cfg, fold, files):
     model2.fit(x_subset_clipped, to_categorical(y_subset, 5), batch_size=128, epochs=10, validation_split=0.1)
     
 
-def run(base_config_path, override_config_path=None, debug=False, resume=False):
+def run(base_config_path, override_config_path=None, debug=False, resume=False, name=None):
     """
     Main function to run the training process.
     Args:
@@ -357,6 +365,7 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False):
         override_config_path (str, optional): Path to the override configuration file. Defaults to None.
         debug (bool, optional): Flag to indicate if the run is in debug mode. Defaults to False.
         resume (bool, optional): Flag to indicate if training should resume from the last checkpoint. Defaults to False.
+        name (str, optional): Name of the experiment. Defaults to None.
     Raises:
         Exception: if something is invalid
     """
@@ -366,6 +375,8 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False):
         # tf.config.experimental.set_memory_growth(gpu, True)
 
     cfg = Configuration(base_config_path, override_config_path)
+    if name is not None:
+        cfg.name = name
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     results_file_path = os.path.join(cfg.save_dir, "results.json")
@@ -378,7 +389,7 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False):
     print(f"{'='*80}")
     
     fold_results = []
-    npz_files = _get_npz_files(cfg.data_path, channel=cfg.dataset.get("eeg_channel"))
+    npz_files = get_npz_files(cfg.data_path, channel=cfg.dataset.get("eeg_channel"))
     if npz_files is None or len(npz_files) == 0:
         raise ValueError(f"No .npz files found in {cfg.data_path} for channel {cfg.dataset.get('eeg_channel')}")
     
@@ -402,6 +413,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug', action='store_true', default=False, help='Set mode to debug or not')
     parser.add_argument('--override', type=str, help='config override path')
     parser.add_argument('--resume', action='store_true', default=False, help='Resume training from last checkpoint')
+    parser.add_argument('--name', type=str, default=None, help='Name of the experiment')
     args = parser.parse_args()
 
-    run(args.config, args.override, debug=args.debug, resume=args.resume)
+    run(args.config, args.override, debug=args.debug, resume=args.resume, name=args.name)
