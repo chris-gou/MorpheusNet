@@ -1,0 +1,7 @@
+# data files
+harm/* 
+*.npz
+*.hdf5
+
+# log files
+*.log
