@@ -2,7 +2,7 @@ import tensorflow as tf
 import numpy as np
 
 # Function that creates the model in the paper. This is the baseline used for all the metrics.
-def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False):
+def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False, blocks = 3, width_mult = 1):
     # Input tensor shape
     inputs = tf.keras.layers.Input(shape=input_shape)
     kernel_sizes = [25,25,25]
@@ -15,10 +15,13 @@ def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_d
     x = tf.keras.layers.MaxPooling2D(pool_size=(1, 3), strides=(1, 2), padding='same')(x)
     # x = tf.keras.layers.Dropout(0.2)(x)
 
+    filters = [32, 64]
+    filters = [int(f * width_mult) for f in filters]
+
     # Residual blocks
-    for i in range(3): 
+    for i in range(blocks): 
         # Separable convolution layer 1
-        residual = tf.keras.layers.Conv2D(filters=32, kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(x)    #orig value = 32
+        residual = tf.keras.layers.Conv2D(filters=filters[0], kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(x)    #orig value = 32
         residual = tf.keras.layers.BatchNormalization()(residual)
         residual = tf.keras.layers.Activation('relu')(residual)
         
@@ -26,12 +29,12 @@ def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_d
         residual = tf.keras.layers.BatchNormalization()(residual)
         residual = tf.keras.layers.Activation('relu')(residual)
         
-        residual = tf.keras.layers.Conv2D(filters=64, kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(residual)
+        residual = tf.keras.layers.Conv2D(filters=filters[1], kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(residual)
         residual = tf.keras.layers.BatchNormalization()(residual)
         
         # Shortcut connection
         if i == 0:
-            x = tf.keras.layers.Conv2D(filters=64, kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(x)
+            x = tf.keras.layers.Conv2D(filters=filters[1], kernel_size=(1, 1), strides=(1, 1), padding='same', use_bias=False)(x)
             x = tf.keras.layers.BatchNormalization()(x)
             
         x = tf.keras.layers.Add()([x, residual])
