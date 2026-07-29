@@ -1,9 +1,14 @@
 from scipy.signal import butter, lfilter, resample
 import random
-import loadmat
+from scipy.io import loadmat
 import numpy as np
 from dreemRead import extract_data
 from trainer import Configuration
+from tensorflow.keras.utils import to_categorical
+from sklearn.utils import shuffle
+import glob 
+import os 
+import functools
 
 SEQ_LEN=12
 
@@ -21,6 +26,20 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = lfilter(b, a, data)
     return y
 
+def get_subject_id(filename):
+    # e.g. 'tr07-0564.npz' -> 'tr07-0564', 'C3-M2_tr08-0111.npz' -> 'tr08-0111'
+    base = os.path.basename(filename).replace('.npz', '')
+    if '_' in base:
+        base = base.split('_')[-1] # case where channel is in front of the file name
+    return base
+
+@functools.lru_cache(maxsize=None)
+def get_npz_files(path, channel=None):
+    print(f"Scanning for .npz files in {path} (channel={channel})...")
+    files = glob.glob(os.path.join(path, '*.npz')) + \
+            glob.glob(os.path.join(path, '*', '*.npz')) + \
+            glob.glob(os.path.join(path, '*', '*', '*.npz'))
+    return sorted(files, key=get_subject_id)
 
 # function to create indecies for each fold
 def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_path=None):
@@ -28,18 +47,20 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
     if fold_number < 0 or fold_number >= total_folds:
         raise ValueError("Fold number is out of range")
     rng = random.Random(seed + fold_number)
-    all_indices = list(range(1, total_folds + 1))
+
     if mat_path is not None:
         splits = loadmat(mat_path)
-        train = [int(i) - 1 for i in splits["train_sub"][fold][0].flatten()]
-        val   = [int(i) - 1 for i in splits["train_check_sub"][fold][0].flatten()]
-        test  = [int(i) - 1 for i in splits["test_sub"][fold][0].flatten()]
+        train = [int(i) - 1 for i in splits["train_sub"][fold_number][0].flatten()]
+        val   = [int(i) - 1 for i in splits["train_check_sub"][fold_number][0].flatten()]
+        test  = [int(i) - 1 for i in splits["test_sub"][fold_number][0].flatten()]
         return train, test, val
 
     if cv_type == "kfold":
+        num_subjects = 993
+        all_indices = list(range(num_subjects))
         subjects_per_fold = len(all_indices) // total_folds
             
-        start = (fold_number - 1) * subjects_per_fold
+        start = fold_number * subjects_per_fold
         end = start + subjects_per_fold
         test_indices = all_indices[start:end]
         
@@ -51,10 +72,12 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
         return train_indices, test_indices, val_indices
     
     if fold_number == 0:
-         raise ValueError("Fold number should be between 1 and total_folds (inclusive)")
+        raise ValueError("Fold number should be between 1 and total_folds (inclusive)")
 
     # LOO fallback
     # Calculate the test index (1 number)
+    all_indices = list(range(1, total_folds + 1))
+
     test_index = fold_number
 
     # Calculate random validation indices (7 distinct integers)
@@ -71,10 +94,12 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
     return training_indices, [test_index], validation_indices
 
     
-def load_subject(idx, cfg: Configuration) -> list[np.array]: 
-    x, hyp = extract_data(idx, path=cfg.data_path, eeg_chan=cfg.eeg_channel,
-                            epoch_length=cfg.epoch_duration)
-
+def load_subject(idx, cfg: Configuration, files: list = None) -> list[np.array]: 
+    x, hyp = extract_data(idx, path=cfg.data_path, eeg_chan=cfg.dataset["eeg_channel"],
+                            epoch_length=cfg.training["epoch_duration"], files=files)
+    if x is None or hyp is None:
+        return None, None  # Return None if data extraction failed
+    
     if x.shape[2] != cfg.window_length:
         # resample data before splitting
         x = butter_bandpass_filter(x, 0.5, 40, 250)    # bandpassing between 0.5 and 40Hz
@@ -87,14 +112,22 @@ def load_subject(idx, cfg: Configuration) -> list[np.array]:
             epochs[num] = (epochs[num] - np.mean(epochs[num])) / np.std(epochs[num])
         hyp = np.array(hyp[:n_epochs]).reshape(n_epochs, 1)
     else:
-        epochs = x
-        hyp    = np.array(hyp).reshape(len(hyp), 1)
+        # epochs = x
+        # hyp    = np.array(hyp).reshape(len(hyp), 1)
+        epochs = np.reshape(x, (len(x), 1, cfg.window_length, 1))
+        if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
+            mu, sigma = np.mean(epochs), np.std(epochs)
+            epochs = (epochs - mu) / (sigma + 1e-8)
+        else:
+            for num in range(len(epochs)):
+                epochs[num] = (epochs[num] - np.mean(epochs[num])) / (np.std(epochs[num]) + 1e-8)
+        hyp = np.array(hyp).reshape(len(hyp), 1)
     return epochs, hyp
 
 def create_set(indices, eeg_channel, data_path, training_params):
     x_set, y_set = [], []
     printed = False
-    epoch_length = training_params.get("epoch_length")
+    epoch_length = training_params.get("epoch_duration")
     for i in indices:
         x,hyp = extract_data(i, path=data_path, eeg_chan=eeg_channel, epoch_length=epoch_length)  
         if not printed:
@@ -123,6 +156,8 @@ def create_seq_sets(indices, interpreter, cfg):
     x_seq, y_seq = [], []
     for idx in indices:
         epochs, hyp = load_subject(idx, cfg)
+        if epochs is None or hyp is None:
+            continue  # Skip if data extraction failed
         hyp = hyp.flatten()
         preds = run_tflite(interpreter, epochs, cfg)
         for i in range(SEQ_LEN, len(epochs)):
@@ -159,3 +194,24 @@ def run_tflite(interpreter, epochs, cfg):
         pred.append(dequantized_output)
     return pred
     
+def data_generator(indices, cfg, shuffle_buffer=5000, files=None):
+    batch_size = cfg.training.get("cnn_batch_size", 512)
+    processed_subjects = 0
+    while True:
+        x_batch, y_batch = [], []
+        for i in indices:
+            epochs, hyp = load_subject(i, cfg, files=files)
+            processed_subjects += 1
+            if epochs is None or hyp is None:
+                continue  # Skip if data extraction failed
+            for ep, label in zip(epochs, hyp):
+                x_batch.append(ep)
+                y_batch.append(label)
+                if len(x_batch) >= shuffle_buffer:
+                    x_batch, y_batch = shuffle(x_batch, y_batch)
+                    while len(x_batch) >= batch_size:
+                        yield np.array(x_batch[:batch_size]), to_categorical(np.array(y_batch[:batch_size]), 5)
+                        x_batch, y_batch = x_batch[batch_size:], y_batch[batch_size:]
+        # if x_batch:
+        #     x_batch, y_batch = shuffle(x_batch, y_batch)
+        #     yield np.array(x_batch), to_categorical(np.array(y_batch), 5)

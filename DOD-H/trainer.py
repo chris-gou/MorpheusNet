@@ -27,24 +27,9 @@ def count_epochs(indices, cfg):
         total += len(epochs)
     return total
 
-def get_subject_id(filename):
-    # e.g. 'tr07-0564.npz' -> 'tr07-0564', 'C3-M2_tr08-0111.npz' -> 'tr08-0111'
-    base = os.path.basename(filename).replace('.npz', '')
-    if '_' in base:
-        base = base.split('_')[-1] # case where channel is in front of the file name
-    return base
-
-@functools.lru_cache(maxsize=None)
-def _get_npz_files(path, channel=None):
-    print(f"Scanning for .npz files in {path} (channel={channel})...")
-    files = glob.glob(os.path.join(path, '*.npz')) + \
-            glob.glob(os.path.join(path, '*', '*.npz')) + \
-            glob.glob(os.path.join(path, '*', '*', '*.npz'))
-    return sorted(files, key=get_subject_id)
-
 def count_epochs_fast(indices, cfg, files=None):
     if files is None:
-        files = _get_npz_files(cfg.data_path)
+        files = get_npz_files(cfg.data_path)
     total = 0
     for i in indices:
         if i < 0 or i >= len(files):
