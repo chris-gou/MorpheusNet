@@ -33,13 +33,14 @@ class Configuration:
         get(key, default=None): Retrieves a value from the configuration using the specified key.
     """
 
-    def __init__(self, base_config_path, override_config_path=None):
+    def __init__(self, base_config_path, override_config_path=None, name=None):
         """
         Initializes the Configuration object.
 
         Args:
             base_config_path (str): Path to the base configuration file.
             override_config_path (str): Path to the override configuration file (optional).
+            name (str): Name of the experiment (optional).
 
         Raises:
             FileNotFoundError: If the configuration file does not exist.
@@ -50,7 +51,8 @@ class Configuration:
         self.dataset = self.config.get("dataset", {})
         self.training = self.config.get("training_params", {})
         self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
-
+        if name is not None:
+            self.name = name
         # default to paper-specified hyperparams since they give the best results
         self.run_type = self.config.get("run_type", "paper_original")
         self.hparams = TRAIN_PARAMS.get(self.run_type, "paper_original")

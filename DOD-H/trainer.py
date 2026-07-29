@@ -374,9 +374,7 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False, 
         tf.config.set_logical_device_configuration(gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=1024*3)])  # limit to 3GB
         # tf.config.experimental.set_memory_growth(gpu, True)
 
-    cfg = Configuration(base_config_path, override_config_path)
-    if name is not None:
-        cfg.name = name
+    cfg = Configuration(base_config_path, override_config_path, name=name)
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     results_file_path = os.path.join(cfg.save_dir, "results.json")
