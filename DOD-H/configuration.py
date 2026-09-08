@@ -52,7 +52,7 @@ class Configuration:
         self.training = self.config.get("training_params", {})
         self.name = self.config.get("name", os.path.basename(override_config_path).replace(".json", "") if override_config_path else os.path.basename(base_config_path).replace(".json", ""))
         if name is not None:
-            self.name = name
+            self.name = self.name + "_" + name
         # default to paper-specified hyperparams since they give the best results
         self.run_type = self.config.get("run_type", "paper_original")
         self.hparams = TRAIN_PARAMS.get(self.run_type, "paper_original")
@@ -63,7 +63,8 @@ class Configuration:
             self.data_path = os.path.join(DB_PATH, self.data_path) 
 
         self.window_length = self.training.get("epoch_duration", 30)  * 100
-        self.save_dir = os.path.join(DB_PATH,'morpheus', self.name)
+        # self.save_dir = os.path.join(DB_PATH,'morpheus', self.name)
+        self.save_dir = os.path.join('results', self.name)
 
     def _load_config(self, base_config_path, override_config_path):
         """

@@ -2,5 +2,6 @@
     "training_params": {
         "num_blocks": 2,
         "epoch_duration": 10
-    }
+    },
+    "name": "SEDF78_10_2"
 }

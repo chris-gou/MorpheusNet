@@ -6,11 +6,12 @@
         "seq_len": 12,
         "targed_idx": -1,
         "root_dir": "./",
-        "path": "PHYSIO2018_harmonized/100Hz_filt/npz"
+        "path": "/home/christina/Documents/MorpheusNet/data/npz/C3-M2"
     },
     "training_params": {
+        "physio_resnet": "false",
         "max_epochs": 500,
-        "batch_size": 128,
+        "cnn_batch_size": 128,
         "lr": 0.001,
         "early_stopping": {
             "mode": "min",

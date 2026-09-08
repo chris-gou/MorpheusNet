@@ -1,11 +1,11 @@
 {
   "dataset": {
-    "name": "Sleep-EDF 20",
-    "eeg_channel": "EEG Fpz-Cz",
+    "name": "SEDF20",
+    "eeg_channel": "Fpz-Cz",
     "seq_len": 12,
     "targed_idx": -1,
     "root_dir": "./",
-    "path": "SEDF20"
+    "path": "/home/christina/Documents/pillow/processed-datasets/w60/SLEEP-EDFX_harmonized/npz/sleep-cassette/Fpz-Cz/sedf20"
   },
   "training_params": {
     "max_epochs": 500,
@@ -26,7 +26,8 @@
     "seq_lr": 0.0001,
     "cnn_lr": 0.001,
     "seq_batch_size": 32,
-    "cv_type": "kfold"
+    "cv_type": "kfold",
+    "mat_path": "sedf20_data_split_eval.mat"
   },
   "name": "SEDF20_30"
 }

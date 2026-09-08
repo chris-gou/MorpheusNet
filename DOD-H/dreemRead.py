@@ -21,6 +21,48 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = lfilter(b, a, data)
     return y
 
+def get_file_fs(filepath, channel='F3-M2',x=None, y=None, epoch_duration=30, file_type='h5'):
+    if file_type == 'h5':
+        if x is not None and y is not None:
+            n_samples = x.shape[0] if x.ndim == 1 else x.shape[-1]
+            n_epochs = y.shape[0]
+            native_fs = n_samples / (n_epochs * 30)
+            return native_fs
+        
+        with h5py.File(filepath, 'r') as f:
+            signals_group = f['signals']
+            if 'eeg' in signals_group and channel in signals_group['eeg']:
+                x = signals_group['eeg'][channel]
+            elif channel in signals_group:
+                x = signals_group[channel]
+            if 'y' in f:
+                y = np.asarray(f['y'], dtype=np.int64)
+            elif 'hypnogram' in f:
+                y = np.asarray(f['hypnogram'], dtype=np.int64)
+
+            n_samples = x.shape[0] if x.ndim == 1 else x.shape[-1]
+            n_epochs = y.shape[0]
+            native_fs = n_samples / (n_epochs * 30)
+        return native_fs
+
+    if file_type == 'npz':
+        npz_file = np.load(filepath, allow_pickle=True)
+        if 'fs' in npz_file:
+            native_fs = npz_file['fs']
+            npz_file.close()
+            return native_fs
+        x = npz_file['x']
+        y = npz_file['y']
+        if x.ndim == 2:
+            samples_per_epoch = x.shape[1]
+        elif x.ndim == 3:
+            samples_per_epoch = x.shape[2]
+        else:
+            raise ValueError(f"Unexpected x shape: {x.shape}")
+        native_fs = samples_per_epoch / 30
+        npz_file.close()
+        return native_fs
+
 # function to read the refrenced F3 signal, EOG and labels
 def do(f1):
     sigs = f1['signals']
@@ -31,7 +73,7 @@ def do(f1):
     hyp = f1['hypnogram']
     return f3,eog1,hyp
 
-def needs_bandpass(x, fs=100, lowcut=0.5, highcut=40, n_samples=20):
+def needs_bandpass(x, fs=100, lowcut=0.3, highcut=35, n_samples=20):
     "Check if signal needs bandpass filtering by checking if it contains frequencies outside the desired range."
     sig = x[:n_samples].reshape(-1) # check first n_samples
     sig = sig - np.mean(sig) # remove DC offset
@@ -44,29 +86,19 @@ def needs_bandpass(x, fs=100, lowcut=0.5, highcut=40, n_samples=20):
 
 # ======== MAIN FUNCS ========
 # Function to extract single channel EEG data based on filetype (npz or h5)
-def extract_data(ind, eeg_chan = 'F3_F4', path = '', epoch_length=30, files=None):
-    if files is None:
-        # find any h5 files in the directory and/or subdirectories, depends on data path
-        h5 = (glob.glob(os.path.join(path, '*.h5'))     +
-            glob.glob(os.path.join(path, '*.hdf5'))   +
-            glob.glob(os.path.join(path, '*', '*.h5')) +
-            glob.glob(os.path.join(path, '*', '*.hdf5')))
-        
-        if h5:
-            x, hyp = extract_h5(ind, h5, epoch_length, channel=eeg_chan)
-            return x, hyp
-    
-    if files is None: # no h5 files found or given, look for npz
-        files = glob.glob(os.path.join(path, '*.npz')) + glob.glob(os.path.join(path, '*', '*.npz')) + glob.glob(os.path.join(path, '*','*', '*.npz'))
+def extract_data(ind, files, eeg_chan = 'F3_F4', path = '', epoch_length=30):
     if len(files) == 0:
         raise FileNotFoundError(f"No .npz or .h5 files found in {path}")
-    # files = glob.glob(os.path.join(path, '*.npz'), recursive=True)
-    # files = glob.glob(os.path.join(path, '**', eeg_chan, '*.npz'), recursive=True)
+
     if ind < 0 or ind >= len(files):
         print(f"Index {ind} is out of range for the available files. Total files: {len(files)}")
         # Skip invalid indices
         return None, None
-    x, hyp = extract_npz(ind, files, epoch_length, eeg_chan)
+
+    if 'h5' in files[0] or 'hdf5' in files[0]:
+        x, hyp = extract_h5(ind, files, epoch_length, channel=eeg_chan)
+    else:
+        x, hyp = extract_npz(ind, files, epoch_length, eeg_chan)
 
     # data cleanup
     mask = hyp != -1 # exclude unknown labels
@@ -95,8 +127,8 @@ def extract_data_bothChan(ind, eeg_chan = 'F3_F4', path = ''):
     x2 = np.array(x2)
     return x, x2, hyp
 
-def split_epochs(epochs_30s, hyp, epoch_duration, fs=100):
-    window = int(epoch_duration*fs)
+def split_epochs(epochs_30s, hyp, target_epoch_duration, fs=100):
+    window = int(target_epoch_duration*fs)
     hop = window
     base_len = 30 * fs
 
@@ -122,17 +154,23 @@ def extract_npz(ind, files, epoch_length, eeg_chan):
     x = npz_file['x']
     y = npz_file['y']
     if eeg_chan not in channel_labels:
-        raise ValueError(f"Index: {ind}, File: {files[ind]}, Channel {eeg_chan} not found in the available channels: {channel_labels}")
-
-    if needs_bandpass(epochs, fs=100): # we assume that data is already filtered but in case it isnt, apply the bandpass filter
-        if ind < 5:
-            print(f"[INFO]: bandpass filtering {eeg_chan} channel between 0.5 and 40 Hz")
-        epochs = butter_bandpass_filter(epochs, 0.5, 40, 100)
+        new_chann_name = f'eeg/{eeg_chan}'
+        if new_chann_name not in channel_labels:
+            raise ValueError(f"Index: {ind}, File: {files[ind]}, Channel {eeg_chan} not found in the available channels: {channel_labels}")
+    original_fs = get_file_fs(files[ind], channel=eeg_chan, x=x, y=y, epoch_duration=epoch_length, file_type='npz')
+    if original_fs != 100:
+        if ind < 2:
+            print(f"[INFO]: resampling {eeg_chan} channel from {original_fs} Hz to 100 Hz")
+        x = resample(x, int(len(x) * 100 / original_fs))
+    if needs_bandpass(x, fs=100): # we assume that data is already filtered but in case it isnt, apply the bandpass filter
+        if ind < 2:
+            print(f"[INFO]: bandpass filtering {eeg_chan} channel between 0.3 and 35 Hz")
+        x = butter_bandpass_filter(x, 0.3, 35, 100)
 
     # Get the index of the desired channel
     chan_idx = np.where(channel_labels == eeg_chan)[0]
     
-    # x is expected to be already epoched at 100 Hz (30 s -> 3000 samples).
+    # x is already epoched at 100 Hz (30 s -> 3000 samples, x s -> x*100 samples).
     if x.ndim == 2 and x.shape[1] == int(epoch_length) * 100:
         epochs = x[:, None, :, None]                       # (n, 1, 3000, 1)
     elif x.ndim == 3 and x.shape[1] == int(epoch_length) * 100:               # (n, 3000, C)
@@ -143,51 +181,70 @@ def extract_npz(ind, files, epoch_length, eeg_chan):
     #     raise ValueError(f"Unexpected x shape (expected pre-epoched), got: {x.shape}")
 
     if epoch_length != 30  and x.shape[1] != int(epoch_length) * 100: # case where the data is not already epoched at the desired length, we need to split the epochs
-        if ind < 5:
-            print(f"[INFO]: splitting epoch into {epoch_length}s chunks") # print this for confirmation that it's going through
+        # if ind < 2:
+        #     print(f"[INFO]: splitting epoch into {epoch_length}s chunks") # print this for confirmation that it's going through
         epochs, y = split_epochs(x, y, epoch_length)
 
-    
     # close file
     npz_file.close()
     return epochs.astype(np.float32), y
 
 # ======== H5 ========
 def extract_h5(ind, files, epoch_length=30, channel='F3_M2'):
-    # Function to extract data from h5 files
+    # Function to extract data from h5 files, handle all possible file layouts
     with h5py.File(files[ind], 'r') as f:
-        if 'signals' in f and channel in f['signals']:
-            signals = np.asarray(f[f'signals/eeg/{channel}/data'], dtype=np.float32)
-            if 'y' in f:
-                y30 = np.asarray(f['y'], dtype=np.int64)
-            return _epoch_continuous(signals, y30, epoch_length, fs=100)
+        if 'signals' not in f:
+            raise KeyError(f"[ERROR]: 'signals' group not found in file {files[ind]}. Available keys: {list(f.keys())}")
+        
+        signals_group = f['signals']
+        if 'eeg' in signals_group and channel in signals_group['eeg']:
+            raw = signals_group['eeg'][channel]
+        elif channel in signals_group:
+            raw = signals_group[channel]
         else:
-            signals = f['signals']
-            eeg = signals['eeg']
-            x = eeg[channel]
-            hyp = f['hypnogram']
-            x = np.array(x)
-            hyp = np.array(hyp)
-            return x, hyp
-    pass
+            raise KeyError(f"[ERROR]: Channel {channel} not found in file {files[ind]}. Available channels: {list(signals_group.keys())}")
 
-def _epoch_continuous(sig, y30, epoch_length, fs=100):
-    """Reshape 1D 100-Hz signal into (n, 1, fs*epoch, 1) z-scored epochs.
-    For 10s/5s, each 30s label is repeated 3 or 6 times (label inheritance)."""
-    sig = butter_bandpass_filter(sig,0.5,40,fs)    #bandpassing between 0.5 and 40Hz
-    spe     = epoch_length * fs
-    n_short = max(1, 30 // epoch_length)
-    n       = min(len(y30) * n_short, len(sig) // spe)
+        if isinstance(raw, h5py.Group):
+            signals = np.asarray(raw['data'], dtype=np.float32)
+        else:
+            signals = np.asarray(raw, dtype=np.float32)
+        x = raw['data'] if isinstance(raw, h5py.Group) else raw
+        if 'y' in f:
+            y30 = np.asarray(f['y'], dtype=np.int64)
+        elif 'hypnogram' in f:
+            y30 = np.asarray(f['hypnogram'], dtype=np.int64)
 
-    x = sig[: n * spe].reshape(n, spe)
-    y = np.repeat(y30, n_short)[:n]
+        original_fs = get_file_fs(files[ind], channel=channel, x=x, y=y30, epoch_duration=epoch_length)
 
-    mask = np.isin(y, [0, 1, 2, 3, 4])           # keep W, N1, N2, N3, REM only
-    x, y = x[mask], y[mask]
+        return _epoch_continuous(signals, y30, epoch_length, target_fs=100, original_fs=original_fs)
 
-    x = (x - x.mean(1, keepdims=True)) / (x.std(1, keepdims=True) + 1e-8)
-    x = x.reshape(-1, 1, spe, 1).astype(np.float32)
-    fr, p = welch(sig, fs=fs, nperseg=1024)
-    # print("[_epoch_continuous] post-filter <0.1 Hz:", round(p[fr < 0.1].sum() / p.sum(), 4))
+def _epoch_continuous(sig, y30, epoch_length, target_fs=100, original_fs=250):
+    if epoch_length == 30:
+        sig = butter_bandpass_filter(sig, 0.5, 40, original_fs)
+        if original_fs != target_fs:
+            sig = resample(sig, int(len(sig) * target_fs / original_fs))
 
-    return x, y
+        spe = epoch_length * 100 # samples per epoch
+        n = len(sig) // spe
+        x = sig[: n * spe].reshape(n, 1, spe, 1)
+
+        for i in range(n):
+            x[i] = (x[i] - np.mean(x[i])) / np.std(x[i])
+
+        y = np.array(y30[:n]).reshape(n, 1)
+        return x.astype(np.float32), y
+    else:
+        sig = butter_bandpass_filter(sig, 0.5, 40, original_fs)
+        if original_fs != target_fs:
+            sig = resample(sig, int(len(sig) * target_fs / original_fs))
+        spe = epoch_length * 100 # samples per epoch
+        n_shorter = 30 // epoch_length
+        n = len(sig) // spe
+        x = sig[: n * spe].reshape(n, 1, spe, 1)
+
+        for i in range(n):
+            x[i] = (x[i] - np.mean(x[i])) / np.std(x[i])
+
+        y = np.repeat(y30, n_shorter)[:n].reshape(n, 1)
+        return x.astype(np.float32), y
+    

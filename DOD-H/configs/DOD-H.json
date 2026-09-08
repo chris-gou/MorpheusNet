@@ -1,16 +1,17 @@
 {
     "dataset": {
         "name": "DOD-H",
-        "eeg_channel": "F3_F4",
+        "eeg_channel": "F3-RPA",
         "num_splits": 20,
         "seq_len": 12,
         "targed_idx": -1,
         "root_dir": "./",
-        "path": "DOD-H_harmonized/npz"
+        "path": "/home/christina/Documents/pillow/processed-datasets/DOD-H_harmonized/hdf5"
     },
     "training_params": {
         "max_epochs": 500,
         "batch_size": 128,
+        "cnn_batch_size": 128,
         "lr": 0.001,
         "early_stopping": {
             "mode": "min",

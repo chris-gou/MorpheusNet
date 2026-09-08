@@ -1,6 +1,8 @@
 {
+
     "training_params": {
         "num_blocks": 2,
         "epoch_duration": 30
-    }
+    },
+    "name": "PHYSIO_30_2"
 }

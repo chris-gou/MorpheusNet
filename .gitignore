@@ -5,3 +5,17 @@ harm/*
 
 # log files
 *.log
+
+.vscode/
+*.npy
+*.tflite
+*.h5
+*.v2
+*.json
+*.pb
+
+results/
+DOD-H/configs/*
+*.png
+*zip
+*pyc

@@ -1,10 +1,10 @@
 import tensorflow as tf
+from tqdm import tqdm
 from nn_model import *
 from dreemRead import *
 from scipy.signal import resample
 from sklearn.utils import shuffle
 from tensorflow.keras.utils import to_categorical
-from scipy.signal import butter, lfilter
 import random
 import json
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, cohen_kappa_score
@@ -15,6 +15,7 @@ import math
 from logger import ResourceLogger
 from pyutils.helpers import notify # own function for sending notifications via ntfy.sh
 import functools
+from sklearn.utils.class_weight import compute_class_weight
 
 os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
 tf.random.set_seed(100)
@@ -29,7 +30,7 @@ def count_epochs(indices, cfg):
 
 def count_epochs_fast(indices, cfg, files=None):
     if files is None:
-        files = get_npz_files(cfg.data_path)
+        files = get_files(cfg.data_path)
     total = 0
     for i in indices:
         if i < 0 or i >= len(files):
@@ -77,11 +78,18 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
         test_ind_path = os.path.join(results_path, f'test_ind_dodh_fold{fold}.npy')
         if not os.path.isfile(test_ind_path):
             test_ind_path = os.path.join(results_path, f'test_ind_fold{fold}.npy')
-        fold_done = os.path.isfile(best_model_file_seq) and os.path.isfile(tflite_path) and os.path.isfile(test_ind_path) # is fold complete? cnn + seq -> nothing to train for this fold
         cnn_done = os.path.isfile(best_model_file_cnn) and os.path.isfile(tflite_path) # is only cnn for this fold complete? -> train seq
+        fold_result_path = os.path.join(results_path, f'fold_{fold}_results.json')
+        cm_file = os.path.join(results_path, f'fold_{fold}_cm.npz')
+        fold_done = (os.path.isfile(best_model_file_seq) and os.path.isfile(tflite_path) 
+                     and os.path.isfile(test_ind_path) and os.path.isfile(fold_result_path))
+        print(f"Fold {fold} status: fold_done={fold_done}, cnn_done={cnn_done}, resume={resume}")
 
         if resume and fold_done:
             print(f"Fold {fold} already completed. Skipping this fold.")
+            with open(fold_result_path, "r") as f:
+                result_dict = json.load(f)
+                return result_dict
             return None 
 
         # Define callbacks
@@ -121,48 +129,90 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
         if not (resume and cnn_done):
             # ===== CNN =====
             optimizer = tf.keras.optimizers.Adam(learning_rate = hp.get("cnn_lr", 0.001))
-            model = separable_resnet((1, cfg.window_length, 1), 5, bias=False, blocks=blocks, width_mult=width)
+
+            if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+                print(f"Fold {fold}: PHYSIO2018_harmonized with physio_resnet=True, creating fp32_submodel and quant_submodel for TFLite conversion.")
+                fp32_submodel, quant_submodel = physio_separable_resnet((1, cfg.window_length, 1), 5, bias=False, blocks=blocks, width_mult=width)
+                model = tf.keras.Model(inputs=fp32_submodel.input, outputs=quant_submodel(fp32_submodel.output), name='full_model')
+            else:
+                model = separable_resnet((1, cfg.window_length, 1), 5, bias=False, blocks=blocks, width_mult=width)
             model.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
+            
             # handle physio separately due to dataset size, avoid memory issues
             if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
                 n_train = count_epochs_fast(train_inds, cfg, files=files)
                 n_val = count_epochs_fast(val_inds, cfg, files=files)
-                steps = math.ceil(n_train / hp.get("cnn_batch_size", 512))
-                val_steps = math.ceil(n_val / hp.get("cnn_batch_size", 512))
+                steps = math.ceil(n_train / hp.get("cnn_batch_size", 128))
+                val_steps = math.ceil(n_val / hp.get("cnn_batch_size", 128))
                 print(f"Training with {n_train} epochs, {steps} steps per epoch | Validation with {n_val} epochs, {val_steps} steps per epoch")
                 model.fit(data_generator(train_inds, cfg, files=files), steps_per_epoch=steps,
                             validation_data=data_generator(val_inds, cfg, files=files), validation_steps=val_steps,
                             callbacks=[checkpoint_callback_cnn, tensorboard_callback_cnn, cnn_logger, profiler_callback], epochs=hp.get("cnn_epochs", 10))
             else:
                 # create train, val, test sets
-                x_train, y_train = create_set(train_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
-                x_val, y_val = create_set(val_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
-                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
-                x_train, y_train = shuffle(x_train, y_train)
-                model.fit(x_train, to_categorical(y_train), batch_size=hp.get("cnn_batch_size", 512), epochs=hp.get("cnn_epochs", 10), 
-                    validation_data = (x_val, to_categorical(y_val)), callbacks = [checkpoint_callback_cnn, tensorboard_callback_cnn, cnn_logger])
-            
+                x_train, y_train = create_set(train_inds, cfg.dataset["eeg_channel"], data_path, training_params=t, cfg=cfg, files=files)
+                unique, counts = np.unique(y_train, return_counts=True)
+                x_val, y_val = create_set(val_inds, cfg.dataset["eeg_channel"], data_path, training_params=t, cfg=cfg, files=files)
+                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t, cfg=cfg, files=files)
+                # x_train, y_train = shuffle(x_train, y_train)
+                # class_weight = compute_class_weight(
+                #     class_weight='balanced',
+                #     classes=np.array([0, 1, 2, 3, 4]),
+                #     y=y_train.flatten()
+                # )
+                # class_weight = dict(enumerate(class_weight))
+                model.fit(x_train, to_categorical(y_train, 5), batch_size=hp.get("cnn_batch_size", 128), epochs=hp.get("cnn_epochs", 10), 
+                    validation_data = (x_val, to_categorical(y_val, 5)), callbacks = [checkpoint_callback_cnn, tensorboard_callback_cnn, cnn_logger])
+            del model
+            tf.keras.backend.clear_session()
             model = tf.keras.models.load_model(best_model_file_cnn)
+            # PHYSIO2018 
+            if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+                print("Fold {fold}: PHYSIO2018_harmonized with physio_resnet=True, creating fp32_submodel and quant_submodel for TFLite conversion.")
+                fp32_output = model.get_layer('fp32_output').output
+                fp32_submodel = tf.keras.Model(inputs=model.input, outputs=fp32_output, name='fp32_submodel_reloaded')
+                quant_submodel = model.get_layer('quant_body')
 
             # ===== PTQ =====
             saved_model_dir = os.path.join(results_path, f'saved_model_fold_{fold}')
-            model.export(saved_model_dir)
+            if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+                saved_model_dir_quant = os.path.join(results_path, f'saved_model_quant_fold_{fold}')
+                quant_submodel.export(saved_model_dir_quant)
+                convert_source_dir = saved_model_dir_quant
+            else:
+                model.export(saved_model_dir)
+                convert_source_dir = saved_model_dir
 
             if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
+                max_subjects = False
+                if max_subjects:
+                    rep_target = 500
+                    REP_MAX_SUBJECTS = 20
+                    rng = np.random.default_rng(100)
+                    sample_inds = rng.choice(train_inds, size=min(REP_MAX_SUBJECTS, len(train_inds)), replace=False)
+                else:
+                    sample_inds = train_inds
                 rep_samples = []
-                for i in train_inds:
+                for i in sample_inds:
                     epochs, _ = load_subject(i, cfg, files=files)
                     rep_samples.extend(epochs)
+                    # if len(rep_samples) >= rep_target:
+                    #     break
                 rep_samples = np.array(rep_samples)
-                x_rep = rep_samples[np.random.randint(0, len(rep_samples), 500)]
+                # x_rep = rep_samples[np.random.randint(0, len(rep_samples), 500)]
+                rng = np.random.default_rng(100)
+                x_rep = rep_samples[rng.integers(0, len(rep_samples), 500)]
             else:
                 x_rep = x_train[np.random.randint(0,len(x_train),500)]
 
             def representative_dataset():
                 for data in x_rep:
-                    yield [data.astype(np.float32).reshape((1,1,epoch_duration*100,1))]
+                    x = data.astype(np.float32).reshape((1, 1, epoch_duration*100, 1))
+                    if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+                        x = fp32_submodel.predict(x, verbose=0)  # transform raw waveform -> stem output (width 750)
+                    yield [x.astype(np.float32)]
                 
-            converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+            converter = tf.lite.TFLiteConverter.from_saved_model(convert_source_dir)
             converter.optimizations = [tf.lite.Optimize.DEFAULT]
             converter.representative_dataset = representative_dataset
             converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
@@ -176,65 +226,104 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
             # cnn predictions 
             if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
                 y_pred_cnn, y_test = [], []
-                for i in test_inds:
+                for i in tqdm(test_inds, desc=f"Fold {fold} CNN test inference"):
                     epochs, labels = load_subject(i, cfg, files=files)
+                    expected_last_dim = cfg.window_length
+                    if epochs is not None and epochs.shape[2] != expected_last_dim:
+                        raise ValueError(f"Unexpected shape for epochs of subject {i}: expected last dimension {expected_last_dim}, got {epochs.shape[2]}")
                     if epochs is None or labels is None:
-                        continue  # Skip if data extraction failed
-                    preds = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
-                    print(f"Fold {fold}: min: {preds.min()}, max: {preds.max()}, unique: {np.unique(preds)}, mean: {preds.mean():.4f}, std: {preds.std():.4f}")
-                    y_pred_cnn.extend(preds)
+                        continue
+                    preds_per_subj = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
+                    # print(f"Fold {fold}: min: {preds.min()}, max: {preds.max()}, unique: {np.unique(preds)}, mean: {preds.mean():.4f}, std: {preds.std():.4f}")
+                    y_pred_cnn.extend(preds_per_subj)
                     y_test.extend(labels)
                 y_pred_cnn, y_test = np.array(y_pred_cnn), np.array(y_test)
             else:
-                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
+                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t, cfg=cfg, files=files)
                 y_pred_cnn = np.argmax(model.predict(x_test, verbose=0), axis=1)
             print(confusion_matrix(y_test, y_pred_cnn, labels=[0, 1, 2, 3, 4]))
         else:
             print(f"Fold {fold} CNN already completed. Skipping CNN training.")
             model = tf.keras.models.load_model(best_model_file_cnn)
+            # PHYSIO2018 
+            if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+                fp32_output = model.get_layer('fp32_output').output
+                fp32_submodel = tf.keras.Model(inputs=model.input, outputs=fp32_output, name='fp32_submodel_reloaded')
+                quant_submodel = model.get_layer('quant_body')
+                
             if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
                 y_pred_cnn, y_test = [], []
-                for i in test_inds:
-                    epochs, labels = load_subject(i, cfg)
+                for i in tqdm(test_inds, desc=f"Fold {fold} CNN test inference"):
+                    epochs, labels = load_subject(i, cfg, files=files)
+                    expected_last_dim = cfg.window_length
+                    if epochs is not None and epochs.shape[2] != expected_last_dim:
+                        raise ValueError(f"Unexpected shape for epochs of subject {i}: expected last dimension {expected_last_dim}, got {epochs.shape[2]}")
                     if epochs is None or labels is None:
                         continue
-                    preds = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
+                    preds_per_subj = np.argmax(model.predict(np.array(epochs), verbose=0), axis=1)
                     # print(f"Fold {fold}: min: {preds.min()}, max: {preds.max()}, unique: {np.unique(preds)}, mean: {preds.mean():.4f}, std: {preds.std():.4f}")
-                    y_pred_cnn.extend(preds)
+                    y_pred_cnn.extend(preds_per_subj)
                     y_test.extend(labels)
                 y_pred_cnn, y_test = np.array(y_pred_cnn), np.array(y_test)
             else:
-                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t)
+                x_test, y_test = create_set(test_inds, cfg.dataset["eeg_channel"], data_path, training_params=t, cfg=cfg, files=files)
                 y_pred_cnn = np.argmax(model.predict(x_test, verbose=0), axis=1)
 
         interpreter = tf.lite.Interpreter(model_path=tflite_path)
         interpreter.allocate_tensors()
+
         # ===== SEQ =====
         # sets
-        x_train_seq, y_train_seq = create_seq_sets(train_inds, interpreter, cfg)
-        x_val_seq, y_val_seq = create_seq_sets(val_inds, interpreter, cfg)
-        x_test_seq, y_test_seq = create_seq_sets(test_inds, interpreter, cfg)
+        print(f"Fold {fold}: creating sequence sets with seq_len={seq_len}")
+        if cfg.dataset["name"] == 'PHYSIO2018_harmonized' and t["physio_resnet"]=="true":
+            x_train_seq, y_train_seq = create_seq_sets(train_inds, interpreter, cfg, fp32_submodel=fp32_submodel, files=files)
+            print(f"Fold {fold}: created train sequence set with {len(x_train_seq)} sequences")
+            x_val_seq, y_val_seq = create_seq_sets(val_inds, interpreter, cfg, fp32_submodel=fp32_submodel, files=files)
+            print(f"Fold {fold}: created val sequence set with {len(x_val_seq)} sequences")
+            x_test_seq, y_test_seq = create_seq_sets(test_inds, interpreter, cfg, fp32_submodel=fp32_submodel, files=files)
+            print(f"Fold {fold}: created test sequence set with {len(x_test_seq)} sequences")
+        else:
+            x_train_seq, y_train_seq = create_seq_sets(train_inds, interpreter, cfg, files=files)
+            x_val_seq, y_val_seq = create_seq_sets(val_inds, interpreter, cfg, files=files)
+            x_test_seq, y_test_seq = create_seq_sets(test_inds, interpreter, cfg, files=files)
 
-        x_arr = np.array(x_train_seq)
-        print("min:", x_arr.min(), "max:", x_arr.max(), "mean:", x_arr.mean(), "std:", x_arr.std())
-        print("NaN:", np.isnan(x_arr).any(), "Inf:", np.isinf(x_arr).any())
+        labels, counts = np.unique(y_test_seq, return_counts=True)
+        class_names = ['Wake', 'N1', 'N2', 'N3', 'REM']
+        dist = {class_names[l]: int(c) for l, c in zip(labels, counts)}
+        print(f"Fold {fold} test class distribution: {dist}")
+        proportions = {k: v/sum(counts) for k, v in dist.items()}
+        print(f"Fold {fold} test class proportions: {proportions}")
 
         x_train_seq = np.reshape(np.array(x_train_seq),(len(x_train_seq),int(seq_len*5)))
         x_val_seq = np.reshape(np.array(x_val_seq),(len(x_val_seq),int(seq_len*5)))
         x_test_seq = np.reshape(np.array(x_test_seq),(len(x_test_seq),int(seq_len*5)))
 
-        optimizer = tf.keras.optimizers.Adam(learning_rate = 1e-3, clipnorm=1.0) # gradient clipping
+        # class_weight = compute_class_weight(
+        #     class_weight='balanced',
+        #     classes=np.array([0, 1, 2, 3, 4]),
+        #     y=y_train_seq_arr
+        # )
+        # class_weight = dict(enumerate(class_weight))
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate = 0.01) # gradient clipping
         seq_learner = seq_model(int(seq_len*5))
         seq_learner.compile(loss = 'categorical_crossentropy', optimizer = optimizer, metrics = ['accuracy'])
-        seq_learner.fit(x_train_seq, to_categorical(y_train_seq), batch_size=hp["seq_batch_size"], epochs=hp["seq_epochs"], 
-                validation_data = (x_val_seq, to_categorical(y_val_seq)), callbacks = [checkpoint_callback_seq, tensorboard_callback_seq, seq_logger])
+        seq_learner.fit(x_train_seq, to_categorical(y_train_seq, 5), batch_size=hp["seq_batch_size"], epochs=hp["seq_epochs"], 
+                validation_data = (x_val_seq, to_categorical(y_val_seq, 5)), callbacks = [checkpoint_callback_seq, tensorboard_callback_seq, seq_logger])
         seq_learner = tf.keras.models.load_model(best_model_file_seq)
             
         y_pred_seq = np.argmax(seq_learner.predict(x_test_seq, verbose=0), axis=1)
         print(confusion_matrix(y_test_seq, y_pred_seq, labels=[0, 1, 2, 3, 4]))  # rows=true, cols=pred
-        print(classification_report(y_test_seq, y_pred_seq, target_names=['Wake', 'N1', 'N2', 'N3', 'REM']))
+        print(classification_report(y_test_seq, y_pred_seq, target_names=['Wake', 'N1', 'N2', 'N3', 'REM'], labels=[0, 1, 2, 3, 4], zero_division=0))
 
-        return {
+        # ===== save per-fold confusion matrices =====
+        cm_cnn = confusion_matrix(y_test, y_pred_cnn, labels=[0, 1, 2, 3, 4])
+        cm_seq = confusion_matrix(y_test_seq, y_pred_seq, labels=[0, 1, 2, 3, 4])
+        cm_path = os.path.join(results_path, f'fold_{fold}_cm.npz')
+        np.savez(cm_path, cnn_cm=cm_cnn, seq_cm=cm_seq)
+
+        fold_result_path = os.path.join(results_path, f'fold_{fold}_results.json')
+        result_dict = {
             "cnn_acc":       float(np.mean(y_pred_cnn == y_test.flatten())),
             "cnn_mf1":       float(f1_score(y_test, y_pred_cnn, average="macro")),
             "cnn_kappa":     float(cohen_kappa_score(y_test.flatten(), y_pred_cnn)),
@@ -244,6 +333,9 @@ def train_fold(cfg: Configuration, fold: int, data_path: str, results_path: str,
             "seq_kappa":     float(cohen_kappa_score(y_test_seq, y_pred_seq)),
             "seq_per_class": f1_score(y_test_seq, y_pred_seq, average=None, labels=[0,1,2,3,4]).tolist(),
         }
+        with open(fold_result_path, "w") as f:
+            json.dump(result_dict, f, indent=4)
+        return result_dict
     except Exception as e:
         print(f"Error in fold {fold}: {e}")
         notify(f"Training failed for {cfg.name} fold {fold} | Error: {e}")
@@ -270,6 +362,7 @@ def aggregate_and_save(cfg: Configuration, fold_results: list) -> dict:
  
     results = {
         "dataset": cfg.name,
+        "dataset path": cfg.dataset["path"],
         "cnn": {
             "accuracy_mean":   float(np.mean(means("cnn_acc"))),
             "mf1_mean":        float(np.mean(means("cnn_mf1"))),
@@ -299,64 +392,6 @@ def aggregate_and_save(cfg: Configuration, fold_results: list) -> dict:
     print(f"Results → {out}")
     return results
 
-def small_train(cfg, fold, files):
-    """
-    Helper function to train on small subset (first 20 subjects) for debugging.
-
-    Args:
-        cfg (Configuration): The configuration object containing all necessary parameters.
-        fold (int): Fold number to train.
-        files (list): List of .npz files to use for training and evaluation.
-    Returns:
-        None
-    """
-    t = cfg.training
-    train_inds, _, _ = get_fold_indices(fold, t.get("folds", 25), seed=100, cv_type=t.get("cv_type", "kfold"), mat_path=t.get("mat_path", None))
-
-    subset_inds = train_inds[:20]
-    x_list, y_list = [], []
-    for i in subset_inds:
-        epochs, labels = load_subject(i, cfg, files=files)
-        if epochs is not None:
-            x_list.append(epochs)
-            y_list.append(labels)
-
-    # check for NaN or Inf in the epochs
-    print(np.isnan(epochs).any(), np.isinf(epochs).any())
-    print(epochs.min(), epochs.max(), epochs.mean(), epochs.std())
-    print(np.var(epochs, axis=0).mean(), np.var(epochs, axis=0).std())
-    x_subset = np.concatenate(x_list, axis=0)
-    y_subset = np.concatenate(y_list, axis=0).flatten()
-    x_subset, y_subset = shuffle(x_subset, y_subset)
-
-    print(x_subset.shape, y_subset.shape)
-    print(np.unique(y_subset, return_counts=True))
-
-    # instantiate and compile the model
-    model = separable_resnet((1, cfg.window_length, 1), 5, bias=False, blocks=3, width_mult=1.0)
-    model.compile(loss='categorical_crossentropy', optimizer=tf.keras.optimizers.Adam(1e-3), metrics=['accuracy'])
-    print(y_subset.min(), y_subset.max(), y_subset.dtype)
-    cat = to_categorical(y_subset, 5)
-    print(np.isnan(cat).any(), cat.shape)
-    print(cat[:5])  # spot check a few rows manually
-    print(cat.sum(axis=1)[:20])
-    for i in range(10):
-        preds = model.predict(x_subset[i:i+1], verbose=10)
-        if np.isnan(preds).any():
-            print(f"epoch {i} produces NaN, max_abs input value: {np.abs(x_subset[i]).max():.2f}")
-
-    print("NaN in preds:", np.isnan(preds).any())
-    print("Inf in preds:", np.isinf(preds).any())
-    print(preds[:3])
-    model.fit(x_subset, to_categorical(y_subset, 5), batch_size=128, epochs=10, validation_split=0.1)
-
-    x_subset_clipped = np.clip(x_subset, -10, 10)
-
-    model2 = separable_resnet((1, cfg.window_length, 1), 5, bias=False, blocks=3, width_mult=1.0)
-    model2.compile(loss='categorical_crossentropy', optimizer=tf.keras.optimizers.Adam(1e-3), metrics=['accuracy'])
-    model2.fit(x_subset_clipped, to_categorical(y_subset, 5), batch_size=128, epochs=10, validation_split=0.1)
-    
-
 def run(base_config_path, override_config_path=None, debug=False, resume=False, name=None):
     """
     Main function to run the training process.
@@ -371,29 +406,23 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False, 
     """
     gpus = tf.config.list_physical_devices('GPU')
     for gpu in gpus:
-        tf.config.set_logical_device_configuration(gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=1024*3)])  # limit to 3GB
+        tf.config.set_logical_device_configuration(gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=1024*5)])  # limit to 5GB
         # tf.config.experimental.set_memory_growth(gpu, True)
 
     cfg = Configuration(base_config_path, override_config_path, name=name)
     os.makedirs(cfg.save_dir, exist_ok=True)
 
-    results_file_path = os.path.join(cfg.save_dir, "results.json")
-    # if os.path.isfile(results_file_path) and not debug:
-    #     print(f"Results already exist for {cfg.name} → {results_file_path}")
-    #     return
-
     print(f"\n{'='*80}")
-    print(f"Config: {cfg.name}  |  epoch: {cfg.training.get("epoch_duration")}s  |  folds: {cfg.training.get("folds")} | Blocks: {cfg.training.get("num_blocks", 3)} | Width multiplier: {cfg.training.get("width_mult", 1.0)}")
+    print(f"Config: {cfg.name} | results path: {cfg.save_dir}  |  epoch: {cfg.training.get("epoch_duration")}s  |  folds: {cfg.training.get("folds")} | Blocks: {cfg.training.get("num_blocks", 3)} | Width multiplier: {cfg.training.get("width_mult", 1.0)}")
     print(f"{'='*80}")
     
     fold_results = []
-    npz_files = get_npz_files(cfg.data_path, channel=cfg.dataset.get("eeg_channel"))
-    if npz_files is None or len(npz_files) == 0:
-        raise ValueError(f"No .npz files found in {cfg.data_path} for channel {cfg.dataset.get('eeg_channel')}")
-    
+    files = get_files(cfg.data_path, channel=cfg.dataset.get("eeg_channel"))
+
     try:
         for fold in range(cfg.training.get("folds", 25)):
-            result = train_fold(cfg, fold, cfg.data_path, cfg.save_dir, resume=resume, files=npz_files)
+        # for fold in range(1):
+            result = train_fold(cfg, fold, cfg.data_path, cfg.save_dir, resume=resume, files=files)
             if result is not None:
                 fold_results.append(result)
     except Exception as e:
@@ -405,8 +434,6 @@ def run(base_config_path, override_config_path=None, debug=False, resume=False, 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--data_path', type=str, default='/mnt/truenas_db/user/christina', help='Path of dataset')
-    parser.add_argument('--output_path', type=str, help='Path to save results')
     parser.add_argument('--config', type=str, default='', help='config file path')
     parser.add_argument('--debug', action='store_true', default=False, help='Set mode to debug or not')
     parser.add_argument('--override', type=str, help='config override path')
