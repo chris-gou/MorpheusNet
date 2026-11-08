@@ -2,7 +2,7 @@ import tensorflow as tf
 import numpy as np
 
 # Function that creates the model in the paper. This is the baseline used for all the metrics.
-def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False, blocks = 3, width_mult = 1):
+def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False, blocks = 3, width_mult = 1, sigmoid=True):
     # Input tensor shape
     inputs = tf.keras.layers.Input(shape=input_shape)
     kernel_sizes = [25,25,25, 25]
@@ -56,7 +56,11 @@ def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_d
         inputs2 = tf.keras.layers.Input(129)
         x2 = tf.keras.layers.Dense(32, 'relu')(inputs2)
         x = tf.keras.layers.concatenate([x2,x])
-    x = tf.keras.layers.Dense(32, 'sigmoid')(x) # change to sigmoid
+
+    if sigmoid:
+        x = tf.keras.layers.Dense(32, 'sigmoid')(x) # change to sigmoid
+    else:
+        x = tf.keras.layers.Dense(32, 'relu')(x)
     # Fully connected layer
     if bias:
         x = tf.keras.layers.Dense(units=num_classes, activation='softmax', bias_initializer = tf.keras.initializers.Constant(init_bias(y_train)))(x)
@@ -71,7 +75,7 @@ def separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_d
 
     return model
 
-def physio_separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False, blocks = 3, width_mult = 1):
+def physio_separable_resnet(input_shape, num_classes, bias = False, y_train = [], reg_drop = False, lstm = False, PSD = False, blocks = 3, width_mult = 1, sigmoid=True):
     # original paper: We addressed this by not quantizing the start block and the identity block, and this improved performance (indicated by **).
      # Input tensor shape
     inputs = tf.keras.layers.Input(shape=input_shape)
@@ -146,7 +150,10 @@ def physio_separable_resnet(input_shape, num_classes, bias = False, y_train = []
         y2 = tf.keras.layers.Dense(32, 'relu')(inputs2)
         y = tf.keras.layers.concatenate([y2, y])
 
-    y = tf.keras.layers.Dense(32, 'sigmoid')(y) # change to sigmoid
+    if sigmoid:
+        x = tf.keras.layers.Dense(32, 'sigmoid')(x) # author: change to sigmoid
+    else:
+        x = tf.keras.layers.Dense(32, 'relu')(x) # original
     # Fully connected layer
     if bias:
         y = tf.keras.layers.Dense(units=num_classes, activation='softmax', bias_initializer = tf.keras.initializers.Constant(init_bias(y_train)))(y)
@@ -159,10 +166,12 @@ def physio_separable_resnet(input_shape, num_classes, bias = False, y_train = []
 
 # Sequence learner model, based on an LSTM layer.
 # drop to MLP 
-def seq_model(input_shape): 
+def seq_model(input_shape, lstm=False): 
     inp = tf.keras.layers.Input((input_shape,1)) # shape is seq_len*classes, 1
-    # x = tf.keras.layers.LSTM(32)(inp)
-    x = tf.keras.layers.Flatten()(inp)
+    if lstm:
+        x = tf.keras.layers.LSTM(32)(inp) # original 
+    else:
+        x = tf.keras.layers.Flatten()(inp) # author's suggestion
     x = tf.keras.layers.Dropout(0.2)(x)
     x = tf.keras.layers.Flatten()(x)
     x = tf.keras.layers.Dense(32,'relu')(x)

@@ -1,19 +1,19 @@
 import psutil
 import threading
 import time
-import numpy as np
 import os
 import pynvml
 import matplotlib
-matplotlib.use("Agg")  
-import matplotlib.pyplot as plt
-import threading
-import seaborn as sns
-from matplotlib.colors import LogNorm
-from matplotlib.ticker import LogLocator, FuncFormatter
-from sklearn.metrics import confusion_matrix, classification_report
 import threading
 
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import LogLocator, FuncFormatter
+import numpy as np
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+
+matplotlib.use("Agg")  
 class EventMarker:
     def __init__(self, start_time=None):
         self.start_time = start_time or time.time()

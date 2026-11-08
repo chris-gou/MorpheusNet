@@ -1,9 +1,6 @@
 import h5py
 import os
-import matplotlib.pyplot as plt
 import numpy as np
-import glob
-import h5py
 from scipy.signal import butter, lfilter, resample, welch
 
 # ======= HELPERS ========
@@ -50,6 +47,8 @@ def get_file_fs(filepath, channel='F3-M2',x=None, y=None, epoch_duration=30, fil
         if 'fs' in npz_file:
             native_fs = npz_file['fs']
             npz_file.close()
+            if type(native_fs) is np.ndarray:
+                native_fs = native_fs.item()  # Convert to scalar if it's a 0-d array
             return native_fs
         x = npz_file['x']
         y = npz_file['y']
@@ -103,7 +102,10 @@ def extract_data(ind, files, eeg_chan = 'F3_F4', path = '', epoch_length=30):
     # data cleanup
     mask = hyp != -1 # exclude unknown labels
     x, hyp = x[mask], hyp[mask]
-    mask = ~np.isnan(x).any(axis=(1,2,3)) & (hyp.flatten() != -1)
+    if len(x.shape) == 3:
+        mask = ~np.isnan(x).any(axis=(1,2)) & (hyp.flatten() != -1)
+    elif len(x.shape) == 4:
+        mask = ~np.isnan(x).any(axis=(1,2,3)) & (hyp.flatten() != -1)
     x, hyp = x[mask], hyp[mask]
     return x, hyp
 
@@ -153,34 +155,33 @@ def extract_npz(ind, files, epoch_length, eeg_chan):
     channel_labels = np.atleast_1d(npz_file['ch_label'])
     x = npz_file['x']
     y = npz_file['y']
+    target_fs = 100
     if eeg_chan not in channel_labels:
         new_chann_name = f'eeg/{eeg_chan}'
         if new_chann_name not in channel_labels:
             raise ValueError(f"Index: {ind}, File: {files[ind]}, Channel {eeg_chan} not found in the available channels: {channel_labels}")
     original_fs = get_file_fs(files[ind], channel=eeg_chan, x=x, y=y, epoch_duration=epoch_length, file_type='npz')
-    if original_fs != 100:
+    if original_fs != target_fs: # assume original signal and follow original morpheus steps: butter -> resample
         if ind < 2:
-            print(f"[INFO]: resampling {eeg_chan} channel from {original_fs} Hz to 100 Hz")
-        x = resample(x, int(len(x) * 100 / original_fs))
-    if needs_bandpass(x, fs=100): # we assume that data is already filtered but in case it isnt, apply the bandpass filter
-        if ind < 2:
-            print(f"[INFO]: bandpass filtering {eeg_chan} channel between 0.3 and 35 Hz")
-        x = butter_bandpass_filter(x, 0.3, 35, 100)
-
+            print(f"[INFO]: bandpass filtering {eeg_chan} channel between 0.5 and 40 Hz")
+        x = butter_bandpass_filter(x, 0.5, 40, original_fs)
+        target_len = int(round(x.shape[-1]*target_fs) / original_fs) # 3000 for 30s at 100hz
+        x = resample(x, target_len, axis=-1)
+        
     # Get the index of the desired channel
     chan_idx = np.where(channel_labels == eeg_chan)[0]
     
     # x is already epoched at 100 Hz (30 s -> 3000 samples, x s -> x*100 samples).
-    if x.ndim == 2 and x.shape[1] == int(epoch_length) * 100:
+    if x.ndim == 2 and x.shape[1] == int(epoch_length) * target_fs:  # (n, 3000)
         epochs = x[:, None, :, None]                       # (n, 1, 3000, 1)
-    elif x.ndim == 3 and x.shape[1] == int(epoch_length) * 100:               # (n, 3000, C)
+    elif x.ndim == 3 and x.shape[1] == int(epoch_length) * target_fs:               # (n, 3000, C)
         epochs = x[:, :, chan_idx][:, None, :, None]
-    elif x.ndim == 3 and x.shape[2] == int(epoch_length) * 100:               # (n, C, 3000)
+    elif x.ndim == 3 and x.shape[2] == int(epoch_length) * target_fs:               # (n, C, 3000)
         epochs = x[:, chan_idx, :][:, None, :, None]
     # else:
     #     raise ValueError(f"Unexpected x shape (expected pre-epoched), got: {x.shape}")
 
-    if epoch_length != 30  and x.shape[1] != int(epoch_length) * 100: # case where the data is not already epoched at the desired length, we need to split the epochs
+    if epoch_length != 30  and x.shape[1] != int(epoch_length) * target_fs: # case where the data is not already epoched at the desired length, we need to split the epochs
         # if ind < 2:
         #     print(f"[INFO]: splitting epoch into {epoch_length}s chunks") # print this for confirmation that it's going through
         epochs, y = split_epochs(x, y, epoch_length)
@@ -229,7 +230,7 @@ def _epoch_continuous(sig, y30, epoch_length, target_fs=100, original_fs=250):
         x = sig[: n * spe].reshape(n, 1, spe, 1)
 
         for i in range(n):
-            x[i] = (x[i] - np.mean(x[i])) / np.std(x[i])
+            x[i] = (x[i] - np.mean(x[i])) / (np.std(x[i])+1e-8) # avoid division by zero
 
         y = np.array(y30[:n]).reshape(n, 1)
         return x.astype(np.float32), y
@@ -243,7 +244,7 @@ def _epoch_continuous(sig, y30, epoch_length, target_fs=100, original_fs=250):
         x = sig[: n * spe].reshape(n, 1, spe, 1)
 
         for i in range(n):
-            x[i] = (x[i] - np.mean(x[i])) / np.std(x[i])
+            x[i] = (x[i] - np.mean(x[i])) / (np.std(x[i])+1e-8) # avoid division by zero
 
         y = np.repeat(y30, n_shorter)[:n].reshape(n, 1)
         return x.astype(np.float32), y

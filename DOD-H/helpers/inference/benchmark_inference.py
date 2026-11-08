@@ -31,6 +31,9 @@ class FIFOContextBuffer():
             return None
         return self.stack_fn(list(self.buffer))
 
+    def reset(self):
+        self.buffer.clear()  
+
 def run_streaming_benchmark_tf(predict_fn, epochs, context_size, n_warmup=10,
                                use_gpu=False, n_iters=200, monitor=True, stack_fn=None):
     """
@@ -111,12 +114,13 @@ def run_streaming_benchmark_tf(predict_fn, epochs, context_size, n_warmup=10,
     return results
 
 # ==== geenerators ======
+
 # yield epoch one at a time 
-def raw_epoch_stream(indices, cfg):
+def raw_epoch_stream(indices, cfg, files=None):
     epoch_duration = cfg.training.get('epoch_duration', 30)
     fs = cfg.training.get('fs', 100)
     for index in indices:
-        epochs, hyp = load_subject(index, cfg)
+        epochs, hyp = load_subject(index, cfg, files=files)
         if epochs is None or hyp is None:
             continue
         for epoch, label in zip(epochs, hyp):
@@ -129,7 +133,7 @@ def cnn_output_stream(indices, cfg, interpreter, input_detail, output_detail):
 
     input_scale, input_zero_point = input_detail['quantization']
     output_scale, output_zero_point = output_detail['quantization']
-    for epoch in raw_epoch_stream(indices, cfg):
+    for epoch in raw_epoch_stream(indices, cfg, files=files):
         x = epoch.reshape(1, 1, fs*epoch_duration, 1) # (1, 1, 3000, 1)
         x_q = np.round(x / input_scale + input_zero_point).astype(np.int8)
         interpreter.set_tensor(input_detail['index'], x_q)
@@ -159,25 +163,28 @@ def make_combined_predict_fn(cnn_predict_fn, seq_predict_fn, seq_len):
  
     return combined_predict_fn, seq_fifo
  
-def measure_e2e_streaming_latency(combined_predict_fn, test_inds, cfg, n_warmup=10):
-    epoch_stream = raw_epoch_stream(test_inds, cfg) # get (epoch, label) pairs
-    epoch_iter = iter(epoch_stream) # iterator object of the pairs
-    # exclude warmup from latency measurements
+def measure_e2e_streaming_latency(combined_predict_fn, seq_fifo, test_inds, cfg, n_warmup=10, files=None, n_latency=5000):
+    warm = raw_epoch_stream(test_inds[:1], cfg, files=files)
     for _ in range(n_warmup):
-        x_raw, _ = next(epoch_iter)
+        x_raw, _ = next(warm)
         combined_predict_fn(x_raw)
- 
+
     latencies_ms = []
     y_true, y_pred = [], []
- 
-    for x_raw, label in epoch_iter:
-        start = time.perf_counter()
-        out = combined_predict_fn(x_raw)
-        latencies_ms.append((time.perf_counter() - start) * 1000)
-        if out is not None:
-            y_true.append(label)
-            y_pred.append(int(np.argmax(out)))
- 
+
+    for idx in test_inds:
+        seq_fifo.reset()
+        for x_raw, label in raw_epoch_stream([idx], cfg, files=files):
+            start = time.perf_counter()
+            out = combined_predict_fn(x_raw)
+            elapsed = (time.perf_counter() - start) * 1000
+            if out is not None:
+                latencies_ms.append(elapsed)
+                y_true.append(label)
+                y_pred.append(int(np.argmax(out)))
+        # stop at a recording boundary once enough epochs are measured
+        if len(latencies_ms) >= n_latency:
+            break
     latencies_ms = np.array(latencies_ms)
     stats = {
         'mean_latency_ms': float(np.mean(latencies_ms)),
@@ -228,6 +235,8 @@ if __name__ == "__main__":
         
         seq_len = 12
         best_model_file_seq = os.path.join(results_dir, f'{cfg.name}_best_seq_fold{fold}.h5')
+        if not os.path.exists(best_model_file_seq) and '_new_data' in cfg.save_dir:
+            best_model_file_seq = best_model_file_seq.replace('_new_data', '')
 
         seq_learner= tf.keras.models.load_model(best_model_file_seq)
 

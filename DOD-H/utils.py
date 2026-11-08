@@ -1,18 +1,20 @@
-from scipy.signal import butter, lfilter, resample
-import random
-from scipy.io import loadmat
-import numpy as np
-from dreemRead import extract_data
-from trainer import Configuration
-from tensorflow.keras.utils import to_categorical
-from sklearn.utils import shuffle
 import glob 
 import os 
 import functools
-import time
+import random
+
+import numpy as np
+from scipy.signal import butter, lfilter
+from scipy.io import loadmat
+from sklearn.utils import shuffle
+from tensorflow.keras.utils import to_categorical
+
+from dreemRead import extract_data
+from trainer import Configuration
+
 SEQ_LEN=12
 
-# Function to create a bandpass filter
+#  ========== Signal processing ==========
 def butter_bandpass(lowcut, highcut, fs, order=5):
     nyquist = 0.5 * fs
     low = lowcut / nyquist
@@ -26,6 +28,16 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = lfilter(b, a, data)
     return y
 
+def normalize_epochs(epochs, dataset_name):
+    if dataset_name == 'PHYSIO2018_harmonized':
+        mu, sigma = np.mean(epochs), np.std(epochs)
+        epochs = (epochs - mu) / (sigma + 1e-8)
+    else:
+        for num, y in enumerate(epochs):
+            epochs[num] = (y- np.mean(y)) / (np.std(y) + 1e-8)
+    return epochs
+
+# ========== file discovery ==========
 def get_subject_id(filename):
     # e.g. 'tr07-0564.npz' -> 'tr07-0564', 'C3-M2_tr08-0111.npz' -> 'tr08-0111'
     base = os.path.basename(filename).replace('.npz', '')
@@ -34,28 +46,35 @@ def get_subject_id(filename):
     return base
 
 @functools.lru_cache(maxsize=None)
-def get_files(path, channel=None):
-    print(f"Scanning for sleep files in {path} (channel={channel})...")
+def get_files(path):
+    print(f"Scanning for sleep files in {path}...")
     files = glob.glob(os.path.join(path, '*.npz')) + \
             glob.glob(os.path.join(path, '*', '*.npz')) + \
             glob.glob(os.path.join(path, '*', '*', '*.npz'))
-    
-    if files is not None:
+
+    if files and len(files) > 0:
         print(f"Found {len(files)} npz files in {path}, proceeding with npz")
         return sorted(files, key=get_subject_id)
     
-    if files is None: # npz not found, check h5 (currently the only other file option)
+    if not files or len(files) == 0: # npz not found, check h5 (currently the only other file option)
         files = (glob.glob(os.path.join(path, '*.h5'))     +
             glob.glob(os.path.join(path, '*.hdf5'))   +
             glob.glob(os.path.join(path, '*', '*.h5')) +
             glob.glob(os.path.join(path, '*', '*.hdf5')))
-    if files is not None:
+    if len(files) > 0:
         print(f"Found {len(files)} h5/hdf5 files in {path}.")
         return sorted(files, key=get_subject_id)
     return None
 
-# function to create indices for each fold
-def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_path=None):
+def subjects_to_files(subject_inds, files):
+    """Map .mat subject indices (0..N-1) to all recording indices of those subjects."""
+    sid = lambda f: os.path.basename(f)[3:5]      # SC4ssN -> ss
+    subjects = sorted({sid(f) for f in files})     # expect 78 unique IDs
+    wanted = {subjects[k] for k in subject_inds}
+    return [i for i, f in enumerate(files) if sid(f) in wanted]
+
+#  ========== fold creation ==========
+def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_path=None, data_path=None):
     if fold_number < 0 or fold_number >= total_folds:
         raise ValueError("Fold number is out of range")
     rng = random.Random(seed + fold_number)
@@ -67,10 +86,15 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
         train = [int(i) - 1 for i in splits["train_sub"][fold_number][0].flatten()]
         val   = [int(i) - 1 for i in splits["eval_sub"][fold_number][0].flatten()]
         test  = [int(i) - 1 for i in splits["test_sub"][fold_number][0].flatten()]
-        return train, test, val
+        print(f"Fold {fold_number}: train={len(train)}, val={len(val)}, test={len(test)}")
+
+        files = get_files(data_path)
+        train, val, test = (subjects_to_files(s, files) for s in (train, val, test))
+        return train, val, test
 
     if cv_type == "kfold": # physio
-        num_subjects = 993
+        num_subjects = len(get_files(data_path))
+        print(f"Total subjects found: {num_subjects}")
         all_indices = list(range(num_subjects))
         subjects_per_fold = len(all_indices) // total_folds
             
@@ -83,7 +107,7 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
         val_indices = rng.sample(remaining, val_size)
         train_indices = [i for i in remaining if i not in val_indices]
             
-        return train_indices, test_indices, val_indices
+        return train_indices, val_indices, test_indices
     
     # LOO fallback
     # Calculate the test index (1 number)
@@ -100,70 +124,43 @@ def get_fold_indices(fold_number, total_folds=25, seed=100, cv_type="loo", mat_p
         i for i in range(total_folds) if i not in [test_index] + validation_indices
     ]
 
-    return training_indices, [test_index], validation_indices
+    return training_indices, validation_indices, [test_index]
     
-def load_subject(idx, cfg: Configuration, files: list = None) -> list[np.array]: 
+#  ========== Subject loading ==========
+def load_subject(idx, cfg: Configuration, files: list = None) -> tuple[np.array, np.array] | tuple[None, None]: 
     x, hyp = extract_data(idx, files, path=cfg.data_path, eeg_chan=cfg.dataset["eeg_channel"],
                             epoch_length=cfg.training["epoch_duration"])
+    epoch_duration = cfg.training.get("epoch_duration", 30)
     if x is None or hyp is None:
         return None, None  # Return None if data extraction failed
 
-    if len(x.shape) > 3:
-        if x.shape[2] != cfg.window_length:
-            print(f"[WARNING] Subject {idx}: unexpected epoch shape {x.shape}, expected last dim {cfg.window_length}. Skipping this subject.")
-            # resample data before splitting
-            x = butter_bandpass_filter(x, 0.5, 40, 250)    # bandpassing between 0.5 and 40Hz
-            x_r = resample(x, int(len(x)*100/250))
-            n_epochs = len(x_r) // cfg.window_length
-            x_r = x_r[:n_epochs * cfg.window_length]
-            hyp = hyp[:n_epochs]
-            epochs = np.reshape(x_r, (n_epochs, 1, cfg.window_length, 1))
-            mu = epochs.mean(axis=(1, 2, 3), keepdims=True)
-            sigma = epochs.std(axis=(1, 2, 3), keepdims=True)
-            epochs = (epochs - mu) / (sigma + 1e-8)
-            # for num in range(len(epochs)):
-            #     epochs[num] = (epochs[num] - np.mean(epochs[num])) / np.std(epochs[num])
-            hyp = np.array(hyp[:n_epochs]).reshape(n_epochs, 1)
-        else:
+    if len(x.shape) > 3: 
+        if x.shape[2] == cfg.window_length: # desired epoch length, no resampling needed, resampling done before
             epochs = np.reshape(x, (len(x), 1, cfg.window_length, 1))
-            if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
-                mu, sigma = np.mean(epochs), np.std(epochs)
-                epochs = (epochs - mu) / (sigma + 1e-8)
-            else:
-                for num, y in enumerate(epochs):
-                    epochs[num] = (y- np.mean(y)) / (np.std(y) + 1e-8)
+            epochs = normalize_epochs(epochs, cfg.dataset["name"])
             hyp = np.array(hyp).reshape(len(hyp), 1)
     else:
-        # print(f"[INFO] Subject {idx}: epoch shape {x.shape} matches expected last dim {cfg.window_length}. No resampling needed.")
-        # epochs = x
-        # hyp    = np.array(hyp).reshape(len(hyp), 1)
-        x = butter_bandpass_filter(x,0.5,40,250)    #bandpassing between 0.5 and 40Hz
-        x_r = resample(x, int(len(x)*100/250))    #ownsampling to 100 Hz
-        inds = np.arange(0,len(x_r),30*100)
-        epochs = np.reshape(x_r,(len(inds),1,3000,1))
-        # epochs = np.reshape(x, (len(x), (len(inds)), cfg.window_length, 1))
-        if cfg.dataset["name"] == 'PHYSIO2018_harmonized':
-            mu, sigma = np.mean(epochs), np.std(epochs)
-            epochs = (epochs - mu) / (sigma + 1e-8)
-        else:
-            for num, y in enumerate(epochs):
-                epochs[num] = (y- np.mean(y)) / (np.std(y) + 1e-8)
+        epochs = x.reshape(-1, 1, epoch_duration * 100, 1)
+        epochs = normalize_epochs(epochs, cfg.dataset["name"])
         hyp = np.array(hyp).reshape(len(hyp), 1)
     return epochs, hyp
 
-# ====== set creation =======
-
-def create_set(indices, eeg_channel, data_path, training_params, cfg, files=None):
+# ====== dataset creation =======
+def create_set(indices, cfg, files=None):
     x_set, y_set = [], []
     printed = False
-    epoch_length = training_params.get("epoch_duration")
+    training = cfg.training
+    epoch_length = training.get("epoch_duration")
     for i in indices:
         x, hyp = load_subject(i, cfg, files=files)  # Use the load_subject function to get preprocessed data
+        if x is None or hyp is None:
+            print(f"[WARN] Subject {i}: data extraction failed, skipping.")
+            continue  # Skip if data extraction failed
         # data is extracted with butter already
         expected_last_dim = epoch_length * 100
         if not printed:
-            print("raw shape", x.shape, "| expected last dim", epoch_length * 100,
-                "->", "RESAMPLE branch" if x.shape[2] != epoch_length * 100 else "passthrough")
+            # print("raw shape", x.shape, "| expected last dim", epoch_length * 100,
+                # "->", "RESAMPLE branch" if x.shape[2] != epoch_length * 100 else "passthrough")
             printed = True
         if  x.shape[2] != expected_last_dim:
             raise ValueError(
@@ -192,48 +189,13 @@ def create_seq_sets(indices, interpreter, cfg, fp32_submodel=None, files=None):
             x_seq.append(preds[i-SEQ_LEN:i])
             y_seq.append(hyp[i-1])
     return x_seq, y_seq
-
-def run_tflite(interpreter, epochs, cfg, fp32_submodel=None):
-    pred = []
-    input_details = interpreter.get_input_details()
-    input_index = input_details[0]["index"]
-    input_scale, input_zero_point = input_details[0]['quantization']
-    output_details = interpreter.get_output_details()
-    output_index = output_details[0]["index"]
-    output_scale, output_zero_point = output_details[0]['quantization']
-    epochs = np.asarray(epochs).reshape((-1, 1, cfg.window_length, 1))
-    if fp32_submodel is not None:
-        input_all = fp32_submodel.predict(epochs, batch_size=128, verbose=0)
-    else:
-        input_all = epochs
-        # input_data = i.reshape((1,1,cfg.window_length,1))
-        # Get the input details (assuming a single input tensor)
-        
-
-    for input_data in input_all:
-        input_data = input_data[np.newaxis, ...]
-        quantized_input = (input_data / input_scale) + input_zero_point
-        quantized_input = quantized_input.astype(np.int8)
-
-        interpreter.set_tensor(input_index, quantized_input)
-        interpreter.invoke()
-        output_data = interpreter.get_tensor(output_index)
-
-        dequantized_output = (output_data.astype(np.float32) - output_zero_point) * output_scale
-        pred.append(dequantized_output)
-
-    return pred
     
 def data_generator(indices, cfg, shuffle_buffer=5000, files=None):
     batch_size = cfg.training.get("cnn_batch_size", 512)
-    processed_subjects = 0
     while True:
         x_batch, y_batch = [], []
         for i in indices:
-            t0 = time.perf_counter()
             epochs, hyp = load_subject(i, cfg, files=files)
-            t1 = time.perf_counter()
-            processed_subjects += 1
             if epochs is None or hyp is None:
                 continue  # Skip if data extraction failed
             for ep, label in zip(epochs, hyp):
@@ -279,3 +241,36 @@ def count_seq_windows(indices, cfg):
         if epochs is not None:
             total += len(epochs) - SEQ_LEN
     return total
+
+
+#  ========== TFLite inference ==========
+def run_tflite(interpreter, epochs, cfg, fp32_submodel=None):
+    pred = []
+    input_details = interpreter.get_input_details()
+    input_index = input_details[0]["index"]
+    input_scale, input_zero_point = input_details[0]['quantization']
+    output_details = interpreter.get_output_details()
+    output_index = output_details[0]["index"]
+    output_scale, output_zero_point = output_details[0]['quantization']
+    epochs = np.asarray(epochs).reshape((-1, 1, cfg.window_length, 1))
+    if fp32_submodel is not None:
+        input_all = fp32_submodel.predict(epochs, batch_size=128, verbose=0)
+    else:
+        input_all = epochs
+        # input_data = i.reshape((1,1,cfg.window_length,1))
+        # Get the input details (assuming a single input tensor)
+
+    for input_data in input_all:
+        input_data = input_data[np.newaxis, ...]
+        quantized_input = quantize(input_data, input_scale, input_zero_point)
+
+        interpreter.set_tensor(input_index, quantized_input)
+        interpreter.invoke()
+        output_data = interpreter.get_tensor(output_index)
+        dequantized_output = (output_data.astype(np.float32) - output_zero_point) * output_scale
+        pred.append(dequantized_output)
+
+    return pred
+
+def quantize(x, scale, zero_point):
+    return (x/scale + zero_point).astype(np.int8)

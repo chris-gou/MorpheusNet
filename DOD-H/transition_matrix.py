@@ -76,7 +76,7 @@ def transition_matrix(hyp, n_classes=5):
 from sklearn.metrics import f1_score
 import numpy as np
 fold = 2
-_, test_inds, _ = get_fold_indices(fold, 5, seed=100, cv_type="kfold", mat_path=None)
+_, _, test_inds= get_fold_indices(fold, 5, seed=100, cv_type="kfold", mat_path=None)
 
 base_config_path = "configs/PHYSIO.json"
 override_config_path = "configs/ablations/PHYSIO_30_3_new_data_old_resnet.json"

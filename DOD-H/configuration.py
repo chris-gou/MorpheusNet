@@ -1,5 +1,6 @@
 import os
 import json 
+import json
 DB_PATH = "/mnt/truenas_db/user/christina"
 
 TRAIN_PARAMS = {
@@ -65,6 +66,10 @@ class Configuration:
         self.window_length = self.training.get("epoch_duration", 30)  * 100
         # self.save_dir = os.path.join(DB_PATH,'morpheus', self.name)
         self.save_dir = os.path.join('results', self.name)
+        os.makedirs(self.save_dir, exist_ok=True)
+        with open(os.path.join(self.save_dir, "config.json"), "w") as f:
+            json.dump(self.config, f, indent=2)
+
 
     def _load_config(self, base_config_path, override_config_path):
         """
